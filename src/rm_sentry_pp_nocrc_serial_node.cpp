@@ -516,10 +516,10 @@ private:
             tf2::Vector3 enemy_gimbal_big = tf2::quatRotate(q_yaw_to_big, enemy_gimbal_yaw);
             tf2::Vector3 velocity_gimbal_big = tf2::quatRotate(q_yaw_to_big, velocity_gimbal_yaw);
 
-            // 2. gimbal_big -> odom (使用 TF2)
+            // 2. gimbal_big -> odom (使用 TF2，获取最新可用变换)
             try {
                 geometry_msgs::msg::TransformStamped transform_odom_to_big = tf_buffer_->lookupTransform(
-                    "map", "gimbal_big", now, rclcpp::Duration::from_seconds(0.10));
+                    "map", "gimbal_big", tf2::TimePointZero);
 
                 tf2::Quaternion q_odom_to_big(
                     transform_odom_to_big.transform.rotation.x,
