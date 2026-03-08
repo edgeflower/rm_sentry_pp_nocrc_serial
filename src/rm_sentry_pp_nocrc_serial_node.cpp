@@ -7,7 +7,7 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
-#include <auto_aim_interfaces/msg/target.hpp>
+#include <armor_interfaces/msg/target.hpp>
 #include <std_msgs/msg/string.hpp>
 
 #include <atomic>
@@ -62,7 +62,7 @@ public:
         imu_pub_ = create_publisher<sensor_msgs::msg::Imu>(imu_topic_, 10);
 
         // Chiral 目标跟踪数据发布者
-        target_tracking_pub_ = create_publisher<auto_aim_interfaces::msg::Target>("target_tracking", 10);
+        target_tracking_pub_ = create_publisher<armor_interfaces::msg::Target>("target_tracking", 10);
 
         cmd_vel_chassis_sub_ = create_subscription<geometry_msgs::msg::Twist>(
             cmd_vel_chassis_topic_, 10,
@@ -452,7 +452,7 @@ private:
         auto now = this->now();
 
         // 1. 发布目标跟踪状态
-        auto_aim_interfaces::msg::Target target_msg;
+        armor_interfaces::msg::Target target_msg;
         target_msg.header.stamp = now;
         target_msg.header.frame_id = "odom";
 
@@ -771,7 +771,7 @@ private:
     // ros
     rclcpp::Time node_start_;
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
-    rclcpp::Publisher<auto_aim_interfaces::msg::Target>::SharedPtr target_tracking_pub_;
+    rclcpp::Publisher<armor_interfaces::msg::Target>::SharedPtr target_tracking_pub_;
     //rclcpp::Publisher<std_msgs::msg::String>::SharedPtr tracker_status_pub_;
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_chassis_sub_;
     rclcpp::Subscription<rm_decision_interfaces::msg::RobotControl>::SharedPtr robot_control_sub_;
