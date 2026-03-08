@@ -133,14 +133,16 @@ private:
         std::lock_guard<std::mutex> lk(tx_mtx_);
         current_cmd_state_.data.speed_vector.vx = msg.linear.x;
         current_cmd_state_.data.speed_vector.vy = msg.linear.y;
-        current_cmd_state_.data.speed_vector.wz = msg.angular.z;
+        //current_cmd_state_.data.speed_vector.wz = msg.angular.z;
         tx_pending_ = true;
+        /*
         RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
             "Twist in: vx=%.3f vy=%.3f wz=%.3f | stored: vx=%d vy=%d wz=%d",
             msg.linear.x, msg.linear.y, msg.angular.z,
             (int)current_cmd_state_.data.speed_vector.vx,
             (int)current_cmd_state_.data.speed_vector.vy,
             (int)current_cmd_state_.data.speed_vector.wz);
+            */
     }
 
     void onRobotControl(const rm_decision_interfaces::msg::RobotControl& msg)
@@ -816,15 +818,17 @@ private:
 
     // tx data
     std::mutex tx_mtx_;
-    rm_sentry_pp::SendRobotCmdData tx_pkt_ {};
+    //rm_sentry_pp::SendRobotCmdData tx_pkt_ {};
     rm_decision_interfaces::msg::RobotControl last_robot_control_cmd_;
     rm_sentry_pp::SendRobotCmdData current_cmd_state_; // 存储最新的底盘和云台期望值
     rm_sentry_pp::SendRobotPostureData current_robot_posture_state_; // 存储最新的机器人姿态信息
 
+    /*
     rm_sentry_pp::ReceiveRobotInfoData current_robot_info_state_; // 存储最新的机器人信息
     rm_sentry_pp::ReceiveGameStatusData current_game_status_state_; // 存储最新的比赛状态信息
     rm_sentry_pp::ReceiveAllRobotHpData current_all_robot_hp_state_; // 存储最新的所有机器人血量信息
     rm_sentry_pp::ReceiveRobotLocation current_robot_location_state_; // 存储最新的机器人位置信息
+    */
 
 
     bool tx_pending_ { false };
