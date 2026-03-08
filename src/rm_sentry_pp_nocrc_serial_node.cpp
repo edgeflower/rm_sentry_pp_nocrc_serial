@@ -63,9 +63,6 @@ public:
 
         // Chiral 目标跟踪数据发布者
         target_tracking_pub_ = create_publisher<auto_aim_interfaces::msg::Target>("target_tracking", 10);
-        // tracker_status_pub_ = create_publisher<std_msgs::msg::String>("tracker_status", 10);
-        // 敌方位置在 base_footprint 坐标系下的发布者
-        enemy_position_base_pub_ = create_publisher<geometry_msgs::msg::PointStamped>("enemy_position_base", 10);
 
         cmd_vel_chassis_sub_ = create_subscription<geometry_msgs::msg::Twist>(
             cmd_vel_chassis_topic_, 10,
@@ -479,17 +476,95 @@ private:
                 break;
         }
 
-        // 根据目标类型发布不同的数据
+        // 2. 计算敌方机器人在 odom 坐标系下的位置
+        if (talos_data.state.status == talos::chrial::TrackerStatus::Tracking) {
+            double enemy_x, enemy_y, enemy_z;
+            double enemy_vx = 0, enemy_vy = 0, enemy_vz = 0;
+
+            if (talos_data.state_kind == talos::chrial::TargetStateKind::Robot) {
+                enemy_x = talos_data.state.robot.position.x;
+                enemy_y = talos_data.state.robot.position.y;
+                enemy_z = talos_data.state.robot.position.z;
+                enemy_vx = talos_data.state.robot.velocity.x;
+                enemy_vy = talos_data.state.robot.velocity.y;
+                enemy_vz = talos_data.state.robot.velocity.z;
+            } else if (talos_data.state_kind == talos::chrial::TargetStateKind::Outpost) {
+                enemy_x = talos_data.state.outpost.position.x;
+                enemy_y = talos_data.state.outpost.position.y;
+                enemy_z = talos_data.state.outpost.position.z;
+                enemy_vx = talos_data.state.outpost.velocity.x;
+                enemy_vy = talos_data.state.outpost.velocity.y;
+                enemy_vz = talos_data.state.outpost.velocity.z;
+            } else {
+                // 无效的目标类型，发布空消息
+                target_tracking_pub_->publish(target_msg);
+                return;
+            }
+
+            // 坐标变换: gimbal_yaw -> gimbal_big -> odom
+            tf2::Vector3 enemy_gimbal_yaw(enemy_x, enemy_y, enemy_z);
+            tf2::Vector3 velocity_gimbal_yaw(enemy_vx, enemy_vy, enemy_vz);
+
+            // 1. gimbal_yaw -> gimbal_big (逆变换)
+            tf2::Quaternion q_big_to_yaw(
+                talos_data.gimbal_link.rotation.x,
+                talos_data.gimbal_link.rotation.y,
+                talos_data.gimbal_link.rotation.z,
+                talos_data.gimbal_link.rotation.w
+            );
+            tf2::Quaternion q_yaw_to_big = q_big_to_yaw.inverse();
+            tf2::Vector3 enemy_gimbal_big = tf2::quatRotate(q_yaw_to_big, enemy_gimbal_yaw);
+            tf2::Vector3 velocity_gimbal_big = tf2::quatRotate(q_yaw_to_big, velocity_gimbal_yaw);
+
+            // 2. gimbal_big -> odom (使用 TF2)
+            try {
+                geometry_msgs::msg::TransformStamped transform_odom_to_big = tf_buffer_->lookupTransform(
+                    "map", "gimbal_big", now, rclcpp::Duration::from_seconds(0.10));
+
+                tf2::Quaternion q_odom_to_big(
+                    transform_odom_to_big.transform.rotation.x,
+                    transform_odom_to_big.transform.rotation.y,
+                    transform_odom_to_big.transform.rotation.z,
+                    transform_odom_to_big.transform.rotation.w
+                );
+                tf2::Vector3 t_odom_to_big(
+                    transform_odom_to_big.transform.translation.x,
+                    transform_odom_to_big.transform.translation.y,
+                    transform_odom_to_big.transform.translation.z
+                );
+
+                // 变换位置和速度到 odom 坐标系
+                tf2::Vector3 enemy_odom_rotated = tf2::quatRotate(q_odom_to_big, enemy_gimbal_big);
+                tf2::Vector3 enemy_odom = enemy_odom_rotated + t_odom_to_big;
+                tf2::Vector3 velocity_odom = tf2::quatRotate(q_odom_to_big, velocity_gimbal_big);
+
+                // 将变换后的位置存入 Target 消息
+                target_msg.position.x = enemy_odom.x();
+                target_msg.position.y = enemy_odom.y();
+                target_msg.position.z = enemy_odom.z();
+                target_msg.velocity.x = velocity_odom.x();
+                target_msg.velocity.y = velocity_odom.y();
+                target_msg.velocity.z = velocity_odom.z();
+
+            } catch (const tf2::TransformException& ex) {
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+                    "TF lookup map->gimbal_big failed: %s", ex.what());
+                target_tracking_pub_->publish(target_msg);
+                return;
+            }
+        } else {
+            // 非跟踪状态，位置设为0
+            target_msg.position.x = 0;
+            target_msg.position.y = 0;
+            target_msg.position.z = 0;
+            target_msg.velocity.x = 0;
+            target_msg.velocity.y = 0;
+            target_msg.velocity.z = 0;
+        }
+
+        // 3. 根据目标类型发布其他数据（位置和速度已通过坐标变换设置）
         if (talos_data.state_kind == talos::chrial::TargetStateKind::Robot) {
             // 机器人目标
-            target_msg.position.x = talos_data.state.robot.position.x;
-            target_msg.position.y = talos_data.state.robot.position.y;
-            target_msg.position.z = talos_data.state.robot.position.z;
-
-            target_msg.velocity.x = talos_data.state.robot.velocity.x;
-            target_msg.velocity.y = talos_data.state.robot.velocity.y;
-            target_msg.velocity.z = talos_data.state.robot.velocity.z;
-
             target_msg.yaw = talos_data.state.robot.yaw;
             target_msg.v_yaw = talos_data.state.robot.v_yaw;
 
@@ -534,14 +609,6 @@ private:
 
         } else if (talos_data.state_kind == talos::chrial::TargetStateKind::Outpost) {
             // 前哨站目标
-            target_msg.position.x = talos_data.state.outpost.position.x;
-            target_msg.position.y = talos_data.state.outpost.position.y;
-            target_msg.position.z = talos_data.state.outpost.position.z;
-
-            target_msg.velocity.x = talos_data.state.outpost.velocity.x;
-            target_msg.velocity.y = talos_data.state.outpost.velocity.y;
-            target_msg.velocity.z = talos_data.state.outpost.velocity.z;
-
             target_msg.yaw = talos_data.state.outpost.yaw;
             target_msg.v_yaw = talos_data.state.outpost.v_yaw;
 
@@ -574,11 +641,7 @@ private:
         tracker_status_pub_->publish(status_msg);
         */
 
-        // 3. 计算并发布敌方机器人在 base_footprint 坐标系下的位置
-        if (talos_data.state.status == talos::chrial::TrackerStatus::Tracking) {
-            publishEnemyPositionInBaseFrame(talos_data, now);
-        }
-
+        // 注释：敌方位置已在函数开头通过坐标变换存入 Target 消息的 position 字段
         // 直接使用 Chiral 提供的位姿数据发布 进行位姿变换，省去发布多个 TF 的麻烦，况且 Chiral 已经在内部做了融合和滤波，直接使用它的结果会更稳定可靠
         /*
 
@@ -636,96 +699,6 @@ private:
 
         tf_broadcaster_->sendTransform(camera_tf);
         */
-    }
-
-    void publishEnemyPositionInBaseFrame(const talos::chrial::TalosData& talos_data, const rclcpp::Time& stamp)
-    {
-        try {
-            // 获取敌方机器人在 gimbal_yaw 坐标系下的位置
-            double enemy_x, enemy_y, enemy_z;
-
-            if (talos_data.state_kind == talos::chrial::TargetStateKind::Robot) {
-                enemy_x = talos_data.state.robot.position.x;
-                enemy_y = talos_data.state.robot.position.y;
-                enemy_z = talos_data.state.robot.position.z;
-            } else if (talos_data.state_kind == talos::chrial::TargetStateKind::Outpost) {
-                enemy_x = talos_data.state.outpost.position.x;
-                enemy_y = talos_data.state.outpost.position.y;
-                enemy_z = talos_data.state.outpost.position.z;
-            } else {
-                return; // 无效的目标类型
-            }
-
-            // 坐标变换: gimbal_yaw -> gimbal_big -> odom
-            // 变换链: odom -> gimbal_big ->[yaw旋转]-> gimbal_yaw
-
-            // 1. 使用 gimbal_link 的旋转部分: gimbal_yaw -> gimbal_big
-            // gimbal_link 描述 gimbal_big -> gimbal_yaw 的变换
-            // 主要包含 yaw 旋转（小云台相对于大云台的水平转动）
-            tf2::Quaternion q_big_to_yaw(
-                talos_data.gimbal_link.rotation.x,
-                talos_data.gimbal_link.rotation.y,
-                talos_data.gimbal_link.rotation.z,
-                talos_data.gimbal_link.rotation.w
-            );
-
-            // 敌方位置在 gimbal_yaw 坐标系下
-            tf2::Vector3 enemy_gimbal_yaw(enemy_x, enemy_y, enemy_z);
-
-            // 逆变换: gimbal_yaw -> gimbal_big (忽略平移，只考虑旋转)
-            // P_big = R^T * P_yaw
-            tf2::Quaternion q_yaw_to_big = q_big_to_yaw.inverse();
-            tf2::Vector3 enemy_gimbal_big = tf2::quatRotate(q_yaw_to_big, enemy_gimbal_yaw);
-
-            // 2. 使用 TF2 获取 map -> gimbal_big 的变换
-            // 使用map测试一下
-            geometry_msgs::msg::TransformStamped transform_odom_to_big;
-            try {
-                transform_odom_to_big = tf_buffer_->lookupTransform(
-                    "map", "gimbal_big",
-                    stamp,
-                    rclcpp::Duration::from_seconds(0.10)); // 100ms 超时
-            } catch (const tf2::TransformException& ex) {
-                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
-                    "TF lookup map->gimbal_big failed: %s", ex.what());
-                return;
-            }
-
-            // 从 TF2 提取变换
-            tf2::Quaternion q_odom_to_big(
-                transform_odom_to_big.transform.rotation.x,
-                transform_odom_to_big.transform.rotation.y,
-                transform_odom_to_big.transform.rotation.z,
-                transform_odom_to_big.transform.rotation.w
-            );
-
-            tf2::Vector3 t_odom_to_big(
-                transform_odom_to_big.transform.translation.x,
-                transform_odom_to_big.transform.translation.y,
-                transform_odom_to_big.transform.translation.z
-            );
-
-            // 3. 变换: gimbal_big -> odom
-            // P_odom = R * P_big + t
-            tf2::Vector3 enemy_odom_rotated = tf2::quatRotate(q_odom_to_big, enemy_gimbal_big);
-            tf2::Vector3 enemy_odom = enemy_odom_rotated + t_odom_to_big;
-
-            // 发布敌方位置
-            geometry_msgs::msg::PointStamped enemy_msg;
-            enemy_msg.header.stamp = stamp;
-            enemy_msg.header.frame_id = "odom";
-            enemy_msg.point.x = enemy_odom.x();
-            enemy_msg.point.y = enemy_odom.y();
-            enemy_msg.point.z = enemy_odom.z();
-
-            enemy_position_base_pub_->publish(enemy_msg);
-
-            RCLCPP_DEBUG(get_logger(), "Enemy position in odom: [%.3f, %.3f, %.3f]",
-                enemy_msg.point.x, enemy_msg.point.y, enemy_msg.point.z);
-
-        } catch (const std::exception& ex) {
-            RCLCPP_ERROR(get_logger(), "Error transforming enemy position: %s", ex.what());
-        }
     }
 
 
@@ -841,7 +814,6 @@ private:
 
     // chiral
     std::unique_ptr<talos::chiral::ipc::TalosDataReader> chiral_reader_;
-    rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr enemy_position_base_pub_;
 };
 
 } // namespace rm_sentry_pp_nocrc_serial
