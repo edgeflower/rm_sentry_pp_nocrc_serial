@@ -130,7 +130,7 @@ private:
         std::lock_guard<std::mutex> lk(tx_mtx_);
         current_cmd_state_.data.speed_vector.vx = msg.linear.x;
         current_cmd_state_.data.speed_vector.vy = msg.linear.y;
-        //current_cmd_state_.data.speed_vector.wz = msg.angular.z;
+        current_cmd_state_.data.speed_vector.wz = target_spin_vel_; // 使用来自 RobotControl 消息的旋转速度，而不是 cmd_vel_chassis 的角速度
         tx_pending_ = true;
         /*
         RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
@@ -146,6 +146,7 @@ private:
     {
         std::lock_guard<std::mutex> lk(tx_mtx_);
         current_cmd_state_.data.gimbal_big.yaw_vel = msg.gimbal_big_yaw_vel;
+        target_spin_vel_ = msg.chassis_spin_vel;
         tx_pending_ = true;
     }
 
@@ -266,6 +267,7 @@ private:
                 continue;
             }
 
+            /* 暂时去除 imu 数据的发布，后续如果需要再加回来
             // 分发（你当前 pocket 只有 IMU 真正从下位机来）
             if (hdr.id == rm_sentry_pp::ID_IMU) {
                 // 强一致性：IMU 的 data_len 必须是
@@ -274,6 +276,7 @@ private:
                     publishImu(imu);
                 }
             }
+            */
             if(hdr.id == rm_sentry_pp::ID_ROBOT_INFO){
                 if(hdr.data_len == sizeof(rm_sentry_pp::ReceiveRobotInfoData::data) && frame_len == sizeof(rm_sentry_pp::ReceiveRobotInfoData)){
                     auto robot_info = rm_sentry_pp::fromBytes<rm_sentry_pp::ReceiveRobotInfoData>(rxbuf.data());
@@ -327,6 +330,7 @@ private:
 
         imu_pub_->publish(imu);
 
+        /* 去除不必要的tf 变换
         // --- 2. 发布 TF 变换 ---
         geometry_msgs::msg::TransformStamped t;
         t.header.stamp = now;
@@ -341,7 +345,7 @@ private:
         // 直接使用上面生成的四元数
         t.transform.rotation = imu.orientation;
 
-        tf_broadcaster_->sendTransform(t);
+        tf_broadcaster_->sendTransform(t);*/
     }
 
     void publishRobotInfo(const rm_sentry_pp::ReceiveRobotInfoData& robot_info_data)
@@ -431,7 +435,8 @@ private:
 
     // 读取线程：定时从 Chiral 读取最新的目标跟踪数据，并发布 ROS 消息
     void chiralLoop()
-    {
+    {   
+        rclcpp::Rate loop_rate(100); // 限制在 100Hz，足够绝大多数比赛场景
         while (rclcpp::ok() && !exit_.load(std::memory_order_relaxed)) {
             if (!chiral_reader_) {
                 std::this_thread::sleep_for(100ms);
@@ -442,8 +447,9 @@ private:
             if (auto data = chiral_reader_->read_new()) {
                 publishTargetTracking(*data);
             } else {
-                std::this_thread::sleep_for(1ms);
+                std::this_thread::sleep_for(100ms);
             }
+            loop_rate.sleep(); // 强制限制循环频率，防止空转烧 CPU
         }
     }
 
@@ -515,7 +521,9 @@ private:
             tf2::Quaternion q_yaw_to_big = q_big_to_yaw.inverse();
             tf2::Vector3 enemy_gimbal_big = tf2::quatRotate(q_yaw_to_big, enemy_gimbal_yaw);
             tf2::Vector3 velocity_gimbal_big = tf2::quatRotate(q_yaw_to_big, velocity_gimbal_yaw);
-
+            if (!tf_buffer_->canTransform("map", "gimbal_big", tf2::TimePointZero)) {
+            return; 
+            }
             // 2. gimbal_big -> odom (使用 TF2，获取最新可用变换)
             try {
                 geometry_msgs::msg::TransformStamped transform_odom_to_big = tf_buffer_->lookupTransform(
@@ -767,6 +775,7 @@ private:
     std::string robot_info_topic_;
     int send_period_ms_ { 5 };
     bool enable_dtr_rts_ { true };
+    float target_spin_vel_ = 0.0f;
 
     // ros
     rclcpp::Time node_start_;
