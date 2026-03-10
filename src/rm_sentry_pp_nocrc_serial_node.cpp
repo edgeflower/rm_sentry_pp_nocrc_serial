@@ -55,6 +55,13 @@ public:
         enable_dtr_rts_ = declare_parameter<bool>("enable_dtr_rts", true);
         imu_parent_frame_ = declare_parameter<std::string>("imu_parent_frame", "chassis");
 
+        // Target lost prediction parameters
+        confidence_decay_lambda_ = declare_parameter<double>("confidence_decay_lambda", 0.5);
+        min_confidence_threshold_ = declare_parameter<double>("min_confidence_threshold", 0.3);
+
+        RCLCPP_INFO(get_logger(), "Target lost prediction: lambda=%.2f, min_threshold=%.2f",
+                    confidence_decay_lambda_, min_confidence_threshold_);
+
         // 初始化 TF2
         tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -467,18 +474,36 @@ private:
             case talos::chrial::TrackerStatus::Idle:
                 target_msg.tracking = false;
                 target_msg.tracking_status = 0; // Idle
+                // Reset confidence when idle
+                last_known_target_.valid = false;
+                last_known_target_.confidence = 0.0;
                 break;
             case talos::chrial::TrackerStatus::Detecting:
                 target_msg.tracking = false;
                 target_msg.tracking_status = 1; // Detecting
+                // Decay confidence during detecting (target not locked yet)
+                if (last_known_target_.valid) {
+                    double time_since_last = (now - last_known_target_.last_update_time).seconds();
+                    last_known_target_.confidence = calculateDecayedConfidence(last_known_target_.confidence, time_since_last);
+                }
+                target_msg.confidence = last_known_target_.confidence;
                 break;
             case talos::chrial::TrackerStatus::Tracking:
                 target_msg.tracking = true;
                 target_msg.tracking_status = 2; // Tracking
+                target_msg.confidence = 1.0;  // Full confidence when tracking
                 break;
             case talos::chrial::TrackerStatus::TempLost:
                 target_msg.tracking = false;
                 target_msg.tracking_status = 3; // TempLost
+                // Decay confidence during temporary loss using exponential decay
+                if (last_known_target_.valid) {
+                    double time_since_last = (now - last_known_target_.last_update_time).seconds();
+                    last_known_target_.confidence = calculateDecayedConfidence(last_known_target_.confidence, time_since_last);
+                    target_msg.confidence = last_known_target_.confidence;
+                } else {
+                    target_msg.confidence = 0.0;
+                }
                 break;
         }
 
@@ -522,7 +547,7 @@ private:
             tf2::Vector3 enemy_gimbal_big = tf2::quatRotate(q_yaw_to_big, enemy_gimbal_yaw);
             tf2::Vector3 velocity_gimbal_big = tf2::quatRotate(q_yaw_to_big, velocity_gimbal_yaw);
             if (!tf_buffer_->canTransform("map", "gimbal_big", tf2::TimePointZero)) {
-            return; 
+            return;
             }
             // 2. gimbal_big -> odom (使用 TF2，获取最新可用变换)
             try {
@@ -554,20 +579,61 @@ private:
                 target_msg.velocity.y = velocity_odom.y();
                 target_msg.velocity.z = velocity_odom.z();
 
+                // Store last known target data for prediction
+                last_known_target_.valid = true;
+                last_known_target_.last_update_time = now;
+                last_known_target_.position_x = enemy_odom.x();
+                last_known_target_.position_y = enemy_odom.y();
+                last_known_target_.position_z = enemy_odom.z();
+                last_known_target_.velocity_x = velocity_odom.x();
+                last_known_target_.velocity_y = velocity_odom.y();
+                last_known_target_.velocity_z = velocity_odom.z();
+                last_known_target_.confidence = 1.0;
+
             } catch (const tf2::TransformException& ex) {
                 RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
                     "TF lookup map->gimbal_big failed: %s", ex.what());
                 target_tracking_pub_->publish(target_msg);
                 return;
             }
+        } else if (talos_data.state.status == talos::chrial::TrackerStatus::TempLost &&
+                   last_known_target_.valid &&
+                   last_known_target_.confidence > min_confidence_threshold_) {
+            // TempLost state with valid last known target and sufficient confidence
+            // Use last known position with decayed confidence for prediction
+            target_msg.position.x = last_known_target_.position_x;
+            target_msg.position.y = last_known_target_.position_y;
+            target_msg.position.z = last_known_target_.position_z;
+            target_msg.velocity.x = last_known_target_.velocity_x;
+            target_msg.velocity.y = last_known_target_.velocity_y;
+            target_msg.velocity.z = last_known_target_.velocity_z;
+
+            // Optional: Predict position based on velocity (simple linear prediction)
+            double time_since_last = (now - last_known_target_.last_update_time).seconds();
+            target_msg.position.x += last_known_target_.velocity_x * time_since_last;
+            target_msg.position.y += last_known_target_.velocity_y * time_since_last;
+            target_msg.position.z += last_known_target_.velocity_z * time_since_last;
+
+            // Use last known target metadata
+            target_msg.yaw = last_known_target_.yaw;
+            target_msg.v_yaw = last_known_target_.v_yaw;
+            target_msg.radius_1 = last_known_target_.radius_1;
+            target_msg.radius_2 = last_known_target_.radius_2;
+            target_msg.dz = last_known_target_.dz;
+            target_msg.armors_num = last_known_target_.armors_num;
+            target_msg.id = last_known_target_.id;
+
+            RCLCPP_DEBUG(get_logger(), "Target TempLost: using last known position with confidence=%.2f",
+                        last_known_target_.confidence);
         } else {
-            // 非跟踪状态，位置设为0
+            // Non-tracking state or confidence too low, clear target data
             target_msg.position.x = 0;
             target_msg.position.y = 0;
             target_msg.position.z = 0;
             target_msg.velocity.x = 0;
             target_msg.velocity.y = 0;
             target_msg.velocity.z = 0;
+            target_msg.confidence = 0.0;
         }
 
         // 3. 根据目标类型发布其他数据（位置和速度已通过坐标变换设置）
@@ -615,6 +681,18 @@ private:
             }
             target_msg.id = oss.str();
 
+            // Store metadata for prediction when tracking
+            if (talos_data.state.status == talos::chrial::TrackerStatus::Tracking) {
+                last_known_target_.yaw = target_msg.yaw;
+                last_known_target_.v_yaw = target_msg.v_yaw;
+                last_known_target_.radius_1 = target_msg.radius_1;
+                last_known_target_.radius_2 = target_msg.radius_2;
+                last_known_target_.dz = target_msg.dz;
+                last_known_target_.armors_num = target_msg.armors_num;
+                last_known_target_.id = target_msg.id;
+                last_known_target_.target_kind = talos::chrial::TargetStateKind::Robot;
+            }
+
         } else if (talos_data.state_kind == talos::chrial::TargetStateKind::Outpost) {
             // 前哨站目标
             target_msg.yaw = talos_data.state.outpost.yaw;
@@ -622,6 +700,18 @@ private:
 
             target_msg.id = "outpost";
             target_msg.armors_num = 3;
+
+            // Store metadata for prediction when tracking
+            if (talos_data.state.status == talos::chrial::TrackerStatus::Tracking) {
+                last_known_target_.yaw = target_msg.yaw;
+                last_known_target_.v_yaw = target_msg.v_yaw;
+                last_known_target_.radius_1 = 0;  // Outpost doesn't have these
+                last_known_target_.radius_2 = 0;
+                last_known_target_.dz = 0;
+                last_known_target_.armors_num = target_msg.armors_num;
+                last_known_target_.id = target_msg.id;
+                last_known_target_.target_kind = talos::chrial::TargetStateKind::Outpost;
+            }
         }
 
         target_tracking_pub_->publish(target_msg);
@@ -823,6 +913,30 @@ private:
 
     // chiral
     std::unique_ptr<talos::chiral::ipc::TalosDataReader> chiral_reader_;
+
+    // Target lost prediction - store last known target data
+    struct LastKnownTarget {
+        bool valid = false;
+        rclcpp::Time last_update_time;
+        double position_x = 0, position_y = 0, position_z = 0;
+        double velocity_x = 0, velocity_y = 0, velocity_z = 0;
+        double yaw = 0, v_yaw = 0;
+        double radius_1 = 0, radius_2 = 0, dz = 0;
+        int32_t armors_num = 0;
+        std::string id;
+        talos::chrial::TargetStateKind target_kind = talos::chrial::TargetStateKind::Robot;
+        double confidence = 1.0;  // Confidence starts at 1.0 when tracking
+    } last_known_target_;
+
+    // Confidence decay parameters
+    double confidence_decay_lambda_ = 0.5;  // Decay rate (lambda) for exponential decay
+    double min_confidence_threshold_ = 0.3;  // Minimum confidence before marking as lost
+
+    // Helper function for exponential confidence decay
+    double calculateDecayedConfidence(double current_confidence, double dt) {
+        // Exponential decay: Confidence_t = Confidence_{t-1} * e^(-lambda * dt)
+        return std::max(0.0, current_confidence * std::exp(-confidence_decay_lambda_ * dt));
+    }
 };
 
 } // namespace rm_sentry_pp_nocrc_serial
