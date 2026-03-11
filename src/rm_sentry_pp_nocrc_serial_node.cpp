@@ -274,7 +274,7 @@ private:
                 continue;
             }
 
-            /* 暂时去除 imu 数据的发布，后续如果需要再加回来
+            // 需要imu数据 与 point_lio的数据通过robot_localization融合 发布平滑高频的里程计数据，供决策系统使用
             // 分发（你当前 pocket 只有 IMU 真正从下位机来）
             if (hdr.id == rm_sentry_pp::ID_IMU) {
                 // 强一致性：IMU 的 data_len 必须是
@@ -283,7 +283,7 @@ private:
                     publishImu(imu);
                 }
             }
-            */
+            
             if(hdr.id == rm_sentry_pp::ID_ROBOT_INFO){
                 if(hdr.data_len == sizeof(rm_sentry_pp::ReceiveRobotInfoData::data) && frame_len == sizeof(rm_sentry_pp::ReceiveRobotInfoData)){
                     auto robot_info = rm_sentry_pp::fromBytes<rm_sentry_pp::ReceiveRobotInfoData>(rxbuf.data());
