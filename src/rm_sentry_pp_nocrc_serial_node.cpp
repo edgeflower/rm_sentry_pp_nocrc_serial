@@ -62,6 +62,11 @@ public:
         RCLCPP_INFO(get_logger(), "Target lost prediction: lambda=%.2f, min_threshold=%.2f",
                     confidence_decay_lambda_, min_confidence_threshold_);
 
+        // Gimbal angle timeout for tracking
+        gimbal_angle_timeout_ms_ = declare_parameter<int>("gimbal_angle_timeout_ms", 300);
+
+        RCLCPP_INFO(get_logger(), "Gimbal angle follow timeout: %d ms", gimbal_angle_timeout_ms_);
+
         // 初始化 TF2
         tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -467,7 +472,7 @@ private:
         // 1. 发布目标跟踪状态
         armor_interfaces::msg::Target target_msg;
         target_msg.header.stamp = now;
-        target_msg.header.frame_id = "odom";
+        target_msg.header.frame_id = "map"; // 目标位置是相对于 odom 的绝对坐标
 
         // 跟踪器状态
         switch (talos_data.state.status) {
@@ -545,6 +550,20 @@ private:
             );
             tf2::Quaternion q_yaw_to_big = q_big_to_yaw.inverse();
             tf2::Vector3 enemy_gimbal_big = tf2::quatRotate(q_yaw_to_big, enemy_gimbal_yaw);
+
+            // 提取 gimbal_yaw 相对 gimbal_big 的 yaw 角度，用于 gimbal_big 跟随
+            double roll, pitch, yaw;
+            tf2::Matrix3x3(q_yaw_to_big).getRPY(roll, pitch, yaw);
+            // 归一化到 [-π, π]
+            while (yaw > M_PI) yaw -= 2 * M_PI;
+            while (yaw < -M_PI) yaw += 2 * M_PI;
+
+            // 更新 gimbal_big 跟随角度，加锁保护
+            {
+                std::lock_guard<std::mutex> lk(tx_mtx_);
+                target_gimbal_big_yaw_angle_ = static_cast<float>(yaw);
+                last_gimbal_angle_update_ = now;  // 记录更新时间
+            }
             tf2::Vector3 velocity_gimbal_big = tf2::quatRotate(q_yaw_to_big, velocity_gimbal_yaw);
             if (!tf_buffer_->canTransform("map", "gimbal_big", tf2::TimePointZero)) {
             return;
@@ -818,7 +837,26 @@ private:
                     rm_sentry_pp::fillHeader(pkt, rm_sentry_pp::ID_ROBOT_CMD);
                     pkt.frame_header.id = rm_sentry_pp::ID_ROBOT_CMD;
                     pkt.time_stamp = nowMs();
-                    pkt.data = current_cmd_state_.data;
+                    pkt.data.speed_vector = current_cmd_state_.data.speed_vector;
+
+                    // gimbal_big 控制模式：角度或速度，互斥
+                    // 检查角度数据是否超时
+                    bool angle_timeout = true;
+                    if (last_gimbal_angle_update_.nanoseconds() != 0) {
+                        auto time_since_update = (this->now() - last_gimbal_angle_update_).nanoseconds() / 1000000LL;
+                        angle_timeout = (time_since_update > gimbal_angle_timeout_ms_);
+                    }
+
+                    if (!angle_timeout) {
+                        // 角度模式：gimbal_big 跟随 gimbal_yaw
+                        pkt.data.gimbal_big.yaw_angle = target_gimbal_big_yaw_angle_;
+                        pkt.data.gimbal_big.yaw_vel = 0.0f;  // 角度模式时速度必须为0
+                    } else {
+                        // 速度模式（来自 RobotControl 消息）
+                        pkt.data.gimbal_big.yaw_angle = 0.0f;
+                        pkt.data.gimbal_big.yaw_vel = current_cmd_state_.data.gimbal_big.yaw_vel;
+                    }
+
                     pkt.eof = rm_sentry_pp::HeaderFrame::EoF();
                 }
 
@@ -866,6 +904,7 @@ private:
     int send_period_ms_ { 5 };
     bool enable_dtr_rts_ { true };
     float target_spin_vel_ = 0.0f;
+    int gimbal_angle_timeout_ms_ { 300 };  // gimbal 角度数据超时时间 (ms)
 
     // ros
     rclcpp::Time node_start_;
@@ -894,6 +933,10 @@ private:
     rm_decision_interfaces::msg::RobotControl last_robot_control_cmd_;
     rm_sentry_pp::SendRobotCmdData current_cmd_state_; // 存储最新的底盘和云台期望值
     rm_sentry_pp::SendRobotPostureData current_robot_posture_state_; // 存储最新的机器人姿态信息
+
+    // Gimbal angle follow data (protected by tx_mtx_)
+    float target_gimbal_big_yaw_angle_ = 0.0f;    // 目标大云台角度（用于跟随 gimbal_yaw）
+    rclcpp::Time last_gimbal_angle_update_;       // 最后更新时间戳，用于超时检测
 
     /*
     rm_sentry_pp::ReceiveRobotInfoData current_robot_info_state_; // 存储最新的机器人信息

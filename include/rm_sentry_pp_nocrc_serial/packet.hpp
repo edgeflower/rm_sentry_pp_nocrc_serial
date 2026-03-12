@@ -163,7 +163,8 @@ struct SendRobotCmdData {
             float wz;
         } speed_vector;
         struct {
-            float yaw_vel;
+            float yaw_vel;  // 大云台转动速度，rad/s
+            float yaw_angle; // 大云台转动角度，rad
         } gimbal_big;
     } data;
 
@@ -193,7 +194,7 @@ static_assert(sizeof(ReceiveGameStatusData) == 11);   // 3 + 4 + 3 + 1
 static_assert(sizeof(ReceiveAllRobotHpData) == 40);   // 3 + 4 + 33 + 1
 static_assert(sizeof(ReceiveRobotLocation) == 48);    // 3 + 4 + 40 + 1
 static_assert(sizeof(ReceiveImuData) == 33);          // 3 + 4 + 24 + 1
-static_assert(sizeof(SendRobotCmdData) == 24);        // 3 + 4 + 16 + 1
+static_assert(sizeof(SendRobotCmdData) == 28);        // 3 + 4 + 16 + 1
 static_assert(sizeof(SendRobotPostureData) == 10);    // 3 + 4 + 2 + 1
 
 template <typename T>
