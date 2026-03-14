@@ -365,11 +365,10 @@ private:
         auto now = this->now();
 
         rm_decision_interfaces::msg::SentryPostureStatus posture_msg;
-        posture_msg.reported_posture = robot_info_data.data.posture;
-
+        posture_msg.reported_posture = robot_info_data.data.posture;         // 下位机实际姿态
+        posture_msg.current_posture = robot_info_data.data.posture;          // 同一个值
 
         // 发布机器人姿态状态
-        // 这里假设你有一个名为 "sentry_posture_status" 的话题
         static auto posture_pub = create_publisher<rm_decision_interfaces::msg::SentryPostureStatus>("sentry_posture_status", 10);
         posture_pub->publish(posture_msg);
 
@@ -537,18 +536,18 @@ private:
                 return;
             }
 
-            // 坐标变换: gimbal_yaw -> gimbal_big -> odom
+            // 坐标变换: gimbal_yaw -> gimbal_big -> map
             tf2::Vector3 enemy_gimbal_yaw(enemy_x, enemy_y, enemy_z);
             tf2::Vector3 velocity_gimbal_yaw(enemy_vx, enemy_vy, enemy_vz);
 
-            // 1. gimbal_yaw -> gimbal_big (逆变换)
-            tf2::Quaternion q_big_to_yaw(
+            // 1. gimbal_yaw -> gimbal_big
+            // 注意：gimbal_link.rotation 表示从 gimbal_yaw 到 gimbal_big 的旋转
+            tf2::Quaternion q_yaw_to_big(
                 talos_data.gimbal_link.rotation.x,
                 talos_data.gimbal_link.rotation.y,
                 talos_data.gimbal_link.rotation.z,
                 talos_data.gimbal_link.rotation.w
             );
-            tf2::Quaternion q_yaw_to_big = q_big_to_yaw.inverse();
             tf2::Vector3 enemy_gimbal_big = tf2::quatRotate(q_yaw_to_big, enemy_gimbal_yaw);
 
             // 提取 gimbal_yaw 相对 gimbal_big 的 yaw 角度，用于 gimbal_big 跟随
@@ -585,7 +584,7 @@ private:
                     transform_odom_to_big.transform.translation.z
                 );
 
-                // 变换位置和速度到 odom 坐标系
+                // 变换位置和速度到 map 坐标系
                 tf2::Vector3 enemy_odom_rotated = tf2::quatRotate(q_odom_to_big, enemy_gimbal_big);
                 tf2::Vector3 enemy_odom = enemy_odom_rotated + t_odom_to_big;
                 tf2::Vector3 velocity_odom = tf2::quatRotate(q_odom_to_big, velocity_gimbal_big);
@@ -760,14 +759,14 @@ private:
 
         // 注释：敌方位置已在函数开头通过坐标变换存入 Target 消息的 position 字段
         // 直接使用 Chiral 提供的位姿数据发布 进行位姿变换，省去发布多个 TF 的麻烦，况且 Chiral 已经在内部做了融合和滤波，直接使用它的结果会更稳定可靠
-        /*
+        
 
         // 4. 发布 TF 变换 (gimbal_link)
         geometry_msgs::msg::TransformStamped gimbal_tf;
         gimbal_tf.header.stamp = now;
         gimbal_tf.header.frame_id = "gimbal_big";
         gimbal_tf.child_frame_id = "gimbal_yaw";
-
+        
         gimbal_tf.transform.translation.x = talos_data.gimbal_link.translation.x;
         gimbal_tf.transform.translation.y = talos_data.gimbal_link.translation.y;
         gimbal_tf.transform.translation.z = talos_data.gimbal_link.translation.z;
@@ -778,7 +777,7 @@ private:
         gimbal_tf.transform.rotation.w = talos_data.gimbal_link.rotation.w;
 
         tf_broadcaster_->sendTransform(gimbal_tf);
-        */
+        
 
 
         /*

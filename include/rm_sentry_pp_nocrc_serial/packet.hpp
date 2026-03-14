@@ -43,7 +43,7 @@ struct ReceiveRobotInfoData
         uint16_t hp;    // 机器人剩余血量
         uint16_t heat;  // 机器人枪管热量
         uint16_t projectile_allowance_17mm; // 17mm弹丸剩余量
-        uint16_t posture; // 机器人姿态   1 进攻 、2 防御 、 3 移动
+        uint16_t posture; // 机器人实际姿态 1=进攻, 2=防御, 3=移动 (下位机控制)
     } data;  // 裁判系统信息
 
     uint8_t eof; // 0xA5
