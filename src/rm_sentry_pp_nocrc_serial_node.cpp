@@ -3,6 +3,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rm_decision_interfaces/msg/detail/friend_location__struct.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <sys/types.h>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2_ros/buffer.h>
@@ -142,6 +143,7 @@ private:
         std::lock_guard<std::mutex> lk(tx_mtx_);
         current_cmd_state_.data.speed_vector.vx = msg.linear.x;
         current_cmd_state_.data.speed_vector.vy = msg.linear.y;
+        //current_cmd_state_.data.speed_vector.wz = 0.0;
         current_cmd_state_.data.speed_vector.wz = target_spin_vel_; // 使用来自 RobotControl 消息的旋转速度，而不是 cmd_vel_chassis 的角速度
         tx_pending_ = true;
         /*
@@ -159,6 +161,8 @@ private:
         std::lock_guard<std::mutex> lk(tx_mtx_);
         current_cmd_state_.data.gimbal_big.yaw_vel = msg.gimbal_big_yaw_vel;
         target_spin_vel_ = msg.chassis_spin_vel;
+        gimbal_big_yaw_angle_ = msg.gimbal_big_yaw_angle;
+        follow_gimbal_big_ = msg.follow_gimbal_big;
         tx_pending_ = true;
     }
 
@@ -330,16 +334,47 @@ private:
         sensor_msgs::msg::Imu imu;
         imu.header.stamp = now;
         imu.header.frame_id = imu_frame_;
+        gimbal_yaw_ = imu_data.data.gimbal_yaw; // 机械角获得
+
+        // IMU 漂移修正：当云台回中且没有跟踪目标时，使用机械角校准 IMU
+        {
+            std::lock_guard<std::mutex> lk(tx_mtx_);
+            bool has_target = last_known_target_.valid && last_known_target_.confidence > min_confidence_threshold_;
+
+            // 校准条件：云台接近回中 + 无跟踪目标 + 距上次校准超过间隔
+            if (std::abs(gimbal_yaw_) < IMU_CALIBRATION_THRESHOLD &&
+                !has_target &&
+                !is_calibrating_imu_ &&
+                (now - last_imu_calibration_time_).seconds() > IMU_CALIBRATION_INTERVAL) {
+
+                // 计算 IMU yaw 与机械角的偏差（机械角作为绝对参考）
+                double imu_yaw = imu_data.data.yaw;
+                imu_yaw_offset_ = imu_yaw - gimbal_yaw_;
+                is_calibrating_imu_ = true;
+                last_imu_calibration_time_ = now;
+
+                RCLCPP_DEBUG(get_logger(), "IMU calibrated: offset=%.3f rad (gimbal_yaw=%.3f, imu_yaw=%.3f)",
+                            imu_yaw_offset_, gimbal_yaw_, imu_yaw);
+            }
+
+            // 有跟踪目标时停止校准（避免运动中误校准）
+            if (has_target) {
+                is_calibrating_imu_ = false;
+            }
+        }
+
+        // 应用修正后的角度
+        double corrected_yaw = imu_data.data.yaw - imu_yaw_offset_;
 
         tf2::Quaternion q;
         // 假设 imu_data 里的顺序是 Roll, Pitch, Yaw
-        q.setRPY(imu_data.data.roll, imu_data.data.pitch, imu_data.data.yaw);
+        q.setRPY(imu_data.data.roll, imu_data.data.pitch, corrected_yaw);
         imu.orientation = tf2::toMsg(q);
 
         imu.angular_velocity.x = imu_data.data.roll_vel;
         imu.angular_velocity.y = imu_data.data.pitch_vel;
         imu.angular_velocity.z = imu_data.data.yaw_vel;
-
+        // 先不发布 imu
         imu_pub_->publish(imu);
 
         /* 去除不必要的tf 变换
@@ -446,7 +481,7 @@ private:
 
     // 读取线程：定时从 Chiral 读取最新的目标跟踪数据，并发布 ROS 消息
     void chiralLoop()
-    {   
+    {
         rclcpp::Rate loop_rate(100); // 限制在 100Hz，足够绝大多数比赛场景
         while (rclcpp::ok() && !exit_.load(std::memory_order_relaxed)) {
             if (!chiral_reader_) {
@@ -456,7 +491,12 @@ private:
 
             // 尝试读取新数据
             if (auto data = chiral_reader_->read_new()) {
-                publishTargetTracking(*data);
+                // TF 查询频率分离：每 N 帧查询一次 TF，其他帧使用缓存
+                bool should_query_tf = (++tf_query_counter_ >= TF_QUERY_INTERVAL);
+                if (should_query_tf) {
+                    tf_query_counter_ = 0;
+                }
+                publishTargetTracking(*data, should_query_tf);
             } else {
                 std::this_thread::sleep_for(100ms);
             }
@@ -464,7 +504,7 @@ private:
         }
     }
 
-    void publishTargetTracking(const talos::chrial::TalosData& talos_data)
+    void publishTargetTracking(const talos::chrial::TalosData& talos_data, bool query_tf = true)
     {
         auto now = this->now();
 
@@ -519,14 +559,14 @@ private:
             if (talos_data.state_kind == talos::chrial::TargetStateKind::Robot) {
                 enemy_x = talos_data.state.robot.position.x;
                 enemy_y = talos_data.state.robot.position.y;
-                enemy_z = talos_data.state.robot.position.z;
+                enemy_z = 0.0;
                 enemy_vx = talos_data.state.robot.velocity.x;
                 enemy_vy = talos_data.state.robot.velocity.y;
                 enemy_vz = talos_data.state.robot.velocity.z;
             } else if (talos_data.state_kind == talos::chrial::TargetStateKind::Outpost) {
                 enemy_x = talos_data.state.outpost.position.x;
                 enemy_y = talos_data.state.outpost.position.y;
-                enemy_z = talos_data.state.outpost.position.z;
+                enemy_z = 0.0;
                 enemy_vx = talos_data.state.outpost.velocity.x;
                 enemy_vy = talos_data.state.outpost.velocity.y;
                 enemy_vz = talos_data.state.outpost.velocity.z;
@@ -564,53 +604,97 @@ private:
                 last_gimbal_angle_update_ = now;  // 记录更新时间
             }
             tf2::Vector3 velocity_gimbal_big = tf2::quatRotate(q_yaw_to_big, velocity_gimbal_yaw);
-            if (!tf_buffer_->canTransform("map", "gimbal_big", tf2::TimePointZero)) {
-            return;
-            }
-            // 2. gimbal_big -> odom (使用 TF2，获取最新可用变换)
-            try {
-                geometry_msgs::msg::TransformStamped transform_odom_to_big = tf_buffer_->lookupTransform(
-                    "map", "gimbal_big", tf2::TimePointZero);
 
-                tf2::Quaternion q_odom_to_big(
-                    transform_odom_to_big.transform.rotation.x,
-                    transform_odom_to_big.transform.rotation.y,
-                    transform_odom_to_big.transform.rotation.z,
-                    transform_odom_to_big.transform.rotation.w
+            // 2. gimbal_big -> map (使用 TF2，支持缓存以降低查询频率)
+            geometry_msgs::msg::TransformStamped transform_map_to_big;
+
+            if (query_tf) {
+                // 查询新的 TF
+                if (!tf_buffer_->canTransform("map", "gimbal_big", tf2::TimePointZero)) {
+                    // 如果没有可用的 TF，尝试使用缓存
+                    if (!has_cached_tf_) {
+                        return;
+                    }
+                    transform_map_to_big = cached_map_to_gimbal_big_;
+                } else {
+                    try {
+                        transform_map_to_big = tf_buffer_->lookupTransform("map", "gimbal_big", tf2::TimePointZero);
+                        // 更新缓存
+                        cached_map_to_gimbal_big_ = transform_map_to_big;
+                        has_cached_tf_ = true;
+                    } catch (const tf2::TransformException& ex) {
+                        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+                            "TF lookup map->gimbal_big failed: %s", ex.what());
+                        if (!has_cached_tf_) {
+                            target_tracking_pub_->publish(target_msg);
+                            return;
+                        }
+                        transform_map_to_big = cached_map_to_gimbal_big_;
+                    }
+                }
+            } else {
+                // 使用缓存的 TF
+                if (!has_cached_tf_) {
+                    // 没有缓存，跳过本帧
+                    return;
+                }
+                transform_map_to_big = cached_map_to_gimbal_big_;
+            }
+
+            try {
+
+                tf2::Quaternion q_map_to_big(
+                    transform_map_to_big.transform.rotation.x,
+                    transform_map_to_big.transform.rotation.y,
+                    transform_map_to_big.transform.rotation.z,
+                    transform_map_to_big.transform.rotation.w
                 );
-                tf2::Vector3 t_odom_to_big(
-                    transform_odom_to_big.transform.translation.x,
-                    transform_odom_to_big.transform.translation.y,
-                    transform_odom_to_big.transform.translation.z
+                tf2::Vector3 t_map_to_big(
+                    transform_map_to_big.transform.translation.x,
+                    transform_map_to_big.transform.translation.y,
+                    transform_map_to_big.transform.translation.z
                 );
 
                 // 变换位置和速度到 map 坐标系
-                tf2::Vector3 enemy_odom_rotated = tf2::quatRotate(q_odom_to_big, enemy_gimbal_big);
-                tf2::Vector3 enemy_odom = enemy_odom_rotated + t_odom_to_big;
-                tf2::Vector3 velocity_odom = tf2::quatRotate(q_odom_to_big, velocity_gimbal_big);
+                tf2::Vector3 enemy_map_rotated = tf2::quatRotate(q_map_to_big, enemy_gimbal_big);
+                tf2::Vector3 enemy_map = enemy_map_rotated + t_map_to_big;
+                tf2::Vector3 velocity_map = tf2::quatRotate(q_map_to_big, velocity_gimbal_big);
 
                 // 将变换后的位置存入 Target 消息
-                target_msg.position.x = enemy_odom.x();
-                target_msg.position.y = enemy_odom.y();
-                target_msg.position.z = enemy_odom.z();
-                target_msg.velocity.x = velocity_odom.x();
-                target_msg.velocity.y = velocity_odom.y();
-                target_msg.velocity.z = velocity_odom.z();
+                target_msg.position.x = enemy_map.x();
+                target_msg.position.y = enemy_map.y();
+                target_msg.position.z = enemy_map.z();
+                target_msg.velocity.x = velocity_map.x();
+                target_msg.velocity.y = velocity_map.y();
+                target_msg.velocity.z = velocity_map.z();
+
+                // 计算预测截断点（考虑底盘响应延迟）
+                // 预测位置 = 当前位置 + 速度 × 延迟时间
+                const double CHASSIS_RESPONSE_DELAY = 0.2;  // 底盘响应延迟（秒）
+                double predicted_x = enemy_map.x() + velocity_map.x() * CHASSIS_RESPONSE_DELAY;
+                double predicted_y = enemy_map.y() + velocity_map.y() * CHASSIS_RESPONSE_DELAY;
+                double predicted_z = 0.0; // 机器人在平面上,毕竟要给导航用
 
                 // Store last known target data for prediction
                 last_known_target_.valid = true;
                 last_known_target_.last_update_time = now;
-                last_known_target_.position_x = enemy_odom.x();
-                last_known_target_.position_y = enemy_odom.y();
-                last_known_target_.position_z = enemy_odom.z();
-                last_known_target_.velocity_x = velocity_odom.x();
-                last_known_target_.velocity_y = velocity_odom.y();
-                last_known_target_.velocity_z = velocity_odom.z();
+                last_known_target_.position_x = enemy_map.x();
+                last_known_target_.position_y = enemy_map.y();
+                last_known_target_.position_z = enemy_map.z();
+                last_known_target_.velocity_x = velocity_map.x();
+                last_known_target_.velocity_y = velocity_map.y();
+                last_known_target_.velocity_z = velocity_map.z();
+                last_known_target_.predicted_x = predicted_x;
+                last_known_target_.predicted_y = predicted_y;
+                last_known_target_.predicted_z = predicted_z;
                 last_known_target_.confidence = 1.0;
+
+                RCLCPP_DEBUG(get_logger(), "Target predicted: pos=(%.2f, %.2f) -> pred=(%.2f, %.2f)",
+                            enemy_map.x(), enemy_map.y(), predicted_x, predicted_y);
 
             } catch (const tf2::TransformException& ex) {
                 RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
-                    "TF lookup map->gimbal_big failed: %s", ex.what());
+                    "TF transform failed: %s", ex.what());
                 target_tracking_pub_->publish(target_msg);
                 return;
             }
@@ -618,19 +702,19 @@ private:
                    last_known_target_.valid &&
                    last_known_target_.confidence > min_confidence_threshold_) {
             // TempLost state with valid last known target and sufficient confidence
-            // Use last known position with decayed confidence for prediction
-            target_msg.position.x = last_known_target_.position_x;
-            target_msg.position.y = last_known_target_.position_y;
-            target_msg.position.z = last_known_target_.position_z;
+            // 从预测截断点开始，继续基于速度进行预测
+            target_msg.position.x = last_known_target_.predicted_x;
+            target_msg.position.y = last_known_target_.predicted_y;
+            target_msg.position.z = last_known_target_.predicted_z;
             target_msg.velocity.x = last_known_target_.velocity_x;
             target_msg.velocity.y = last_known_target_.velocity_y;
             target_msg.velocity.z = last_known_target_.velocity_z;
 
-            // Optional: Predict position based on velocity (simple linear prediction)
+            // 继续预测：从丢失时刻到现在的时间间隔内的运动
             double time_since_last = (now - last_known_target_.last_update_time).seconds();
             target_msg.position.x += last_known_target_.velocity_x * time_since_last;
             target_msg.position.y += last_known_target_.velocity_y * time_since_last;
-            target_msg.position.z += last_known_target_.velocity_z * time_since_last;
+            target_msg.position.z = 0.0;
 
             // Use last known target metadata
             target_msg.yaw = last_known_target_.yaw;
@@ -641,8 +725,8 @@ private:
             target_msg.armors_num = last_known_target_.armors_num;
             target_msg.id = last_known_target_.id;
 
-            RCLCPP_DEBUG(get_logger(), "Target TempLost: using last known position with confidence=%.2f",
-                        last_known_target_.confidence);
+            RCLCPP_DEBUG(get_logger(), "Target TempLost: using predicted position (%.2f, %.2f) with confidence=%.2f",
+                        target_msg.position.x, target_msg.position.y, last_known_target_.confidence);
         } else {
             // Non-tracking state or confidence too low, clear target data
             target_msg.position.x = 0;
@@ -717,7 +801,7 @@ private:
             target_msg.v_yaw = talos_data.state.outpost.v_yaw;
 
             target_msg.id = "outpost";
-            target_msg.armors_num = 3;
+            target_msg.armors_num = 3; // 暂定为3，以后再改
 
             // Store metadata for prediction when tracking
             if (talos_data.state.status == talos::chrial::TrackerStatus::Tracking) {
@@ -762,6 +846,7 @@ private:
         
 
         // 4. 发布 TF 变换 (gimbal_link)
+        /*
         geometry_msgs::msg::TransformStamped gimbal_tf;
         gimbal_tf.header.stamp = now;
         gimbal_tf.header.frame_id = "gimbal_big";
@@ -777,6 +862,7 @@ private:
         gimbal_tf.transform.rotation.w = talos_data.gimbal_link.rotation.w;
 
         tf_broadcaster_->sendTransform(gimbal_tf);
+        */
         
 
 
@@ -840,22 +926,10 @@ private:
 
                     // gimbal_big 控制模式：角度或速度，互斥
                     // 检查角度数据是否超时
-                    bool angle_timeout = true;
-                    if (last_gimbal_angle_update_.nanoseconds() != 0) {
-                        auto time_since_update = (this->now() - last_gimbal_angle_update_).nanoseconds() / 1000000LL;
-                        angle_timeout = (time_since_update > gimbal_angle_timeout_ms_);
-                    }
-
-                    if (!angle_timeout) {
-                        // 角度模式：gimbal_big 跟随 gimbal_yaw
-                        pkt.data.gimbal_big.yaw_angle = target_gimbal_big_yaw_angle_;
-                        pkt.data.gimbal_big.yaw_vel = 0.0f;  // 角度模式时速度必须为0
-                    } else {
-                        // 速度模式（来自 RobotControl 消息）
-                        pkt.data.gimbal_big.yaw_angle = 0.0f;
-                        pkt.data.gimbal_big.yaw_vel = current_cmd_state_.data.gimbal_big.yaw_vel;
-                    }
-
+                    
+                    pkt.data.gimbal_big.yaw_angle = gimbal_big_yaw_angle_; // 持续发布最新的角度值，无论是否超时    
+                    pkt.data.gimbal_big.yaw_vel = current_cmd_state_.data.gimbal_big.yaw_vel;
+                    
                     pkt.eof = rm_sentry_pp::HeaderFrame::EoF();
                 }
 
@@ -874,7 +948,8 @@ private:
                     rm_sentry_pp::fillHeader(pkt, rm_sentry_pp::ID_ROBOT_POSTURE);
                     pkt.frame_header.id = rm_sentry_pp::ID_ROBOT_POSTURE;
                     pkt.time_stamp = nowMs();
-                    pkt.data = current_robot_posture_state_.data;
+                    pkt.data.posture = current_robot_posture_state_.data.posture;
+                    pkt.data.follow_gimbal_big = follow_gimbal_big_;
                     pkt.eof = rm_sentry_pp::HeaderFrame::EoF();
                 }
 
@@ -936,6 +1011,16 @@ private:
     // Gimbal angle follow data (protected by tx_mtx_)
     float target_gimbal_big_yaw_angle_ = 0.0f;    // 目标大云台角度（用于跟随 gimbal_yaw）
     rclcpp::Time last_gimbal_angle_update_;       // 最后更新时间戳，用于超时检测
+    float gimbal_big_yaw_angle_ = 0.0f;           // 获得持续发布的角度
+    float follow_gimbal_big_ = 0.0f;              // 底盘跟随
+    float gimbal_yaw_ = 0.0f;                     // gimbal_yaw 机械角
+
+    // IMU drift correction (protected by tx_mtx_)
+    double imu_yaw_offset_ = 0.0;                 // IMU yaw 偏移量（用于修正漂移）
+    bool is_calibrating_imu_ = false;             // 是否正在校准 IMU
+    rclcpp::Time last_imu_calibration_time_;      // 上次 IMU 校准时间
+    static constexpr double IMU_CALIBRATION_THRESHOLD = 0.05;  // 云台回中阈值（弧度）
+    static constexpr double IMU_CALIBRATION_INTERVAL = 2.0;    // 校准间隔（秒）
 
     /*
     rm_sentry_pp::ReceiveRobotInfoData current_robot_info_state_; // 存储最新的机器人信息
@@ -968,7 +1053,16 @@ private:
         std::string id;
         talos::chrial::TargetStateKind target_kind = talos::chrial::TargetStateKind::Robot;
         double confidence = 1.0;  // Confidence starts at 1.0 when tracking
+
+        // 预测截断点（用于底盘追击）
+        double predicted_x = 0, predicted_y = 0, predicted_z = 0;
     } last_known_target_;
+
+    // TF query frequency control
+    int tf_query_counter_ = 0;
+    static constexpr int TF_QUERY_INTERVAL = 10;  // 每 10 帧（10Hz）查询一次 TF
+    geometry_msgs::msg::TransformStamped cached_map_to_gimbal_big_;  // 缓存的 TF 变换
+    bool has_cached_tf_ = false;
 
     // Confidence decay parameters
     double confidence_decay_lambda_ = 0.5;  // Decay rate (lambda) for exponential decay

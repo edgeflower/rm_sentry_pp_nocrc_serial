@@ -140,6 +140,7 @@ struct ReceiveImuData {
 
     struct {
         uint8_t self_color; // 0=红色，1=蓝色
+        float gimbal_yaw; // 小云台机械角 与上电时偏移角度（正中心） 单位 °
         float yaw; // rad
         float pitch; // rad
         float roll; // rad
@@ -180,6 +181,8 @@ struct SendRobotPostureData   // 机器人姿态 0x0120
     struct
     {
         uint16_t posture; // 机器人姿态    1 进攻 、2 防御 、 3 移动
+        uint16_t follow_gimbal_big; // 是否跟随大云台 0 不跟随 1 跟随  //底盘跟随
+        //uint16_t track_status;      // 是否启动履带 0 不启动 1 启动
     } data;
 
     uint8_t eof; // 0xA5
@@ -193,9 +196,9 @@ static_assert(sizeof(ReceiveRobotInfoData) == 19);    // 3 + 4 + 12 + 1
 static_assert(sizeof(ReceiveGameStatusData) == 11);   // 3 + 4 + 3 + 1
 static_assert(sizeof(ReceiveAllRobotHpData) == 40);   // 3 + 4 + 33 + 1
 static_assert(sizeof(ReceiveRobotLocation) == 48);    // 3 + 4 + 40 + 1
-static_assert(sizeof(ReceiveImuData) == 33);          // 3 + 4 + 24 + 1
+static_assert(sizeof(ReceiveImuData) == 37);          // 3 + 4 + 24 + 1
 static_assert(sizeof(SendRobotCmdData) == 28);        // 3 + 4 + 16 + 1
-static_assert(sizeof(SendRobotPostureData) == 10);    // 3 + 4 + 2 + 1
+static_assert(sizeof(SendRobotPostureData) == 12);    // 3 + 4 + 6 + 1
 
 template <typename T>
 inline std::vector<uint8_t> toVector(const T& obj)
