@@ -1,8 +1,12 @@
 #include <geometry_msgs/msg/twist.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
+#include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rm_decision_interfaces/msg/detail/friend_location__struct.hpp>
+#include <rm_decision_interfaces/msg/detail/rfid__struct.hpp>
+#include <rm_decision_interfaces/msg/detail/rfid_parse__struct.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <visualization_msgs/msg/marker.hpp>
 #include <sys/types.h>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
@@ -32,6 +36,8 @@
 #include <rm_decision_interfaces/msg/friend_location.hpp>
 #include <rm_decision_interfaces/msg/robot_location.hpp>
 #include <rm_decision_interfaces/msg/robot_status.hpp>
+#include<rm_decision_interfaces/msg/rfid.hpp>
+#include<rm_decision_interfaces/msg/rfid_parse.hpp>
 
 #include "chiral/talos_triple_buffer_shm.hpp"
 
@@ -65,6 +71,8 @@ public:
 
         // Gimbal angle timeout for tracking
         gimbal_angle_timeout_ms_ = declare_parameter<int>("gimbal_angle_timeout_ms", 300);
+        gimbal_follow_path_topic_ = declare_parameter<std::string>("gimbal_follow_path_topic", "plan");
+        gimbal_follow_lookahead_ = declare_parameter<double>("gimbal_follow_lookahead", 1.5);
 
         RCLCPP_INFO(get_logger(), "Gimbal angle follow timeout: %d ms", gimbal_angle_timeout_ms_);
 
@@ -76,6 +84,7 @@ public:
 
         // Chiral 目标跟踪数据发布者
         target_tracking_pub_ = create_publisher<armor_interfaces::msg::Target>("target_tracking", 10);
+        gimbal_yaw_marker_pub_ = create_publisher<visualization_msgs::msg::Marker>("expected_gimbal_yaw", 10);
 
         cmd_vel_chassis_sub_ = create_subscription<geometry_msgs::msg::Twist>(
             cmd_vel_chassis_topic_, 10,
@@ -84,6 +93,11 @@ public:
         robot_control_sub_ = create_subscription<rm_decision_interfaces::msg::RobotControl>(
             robot_control_topic_, 10,
             [this](const rm_decision_interfaces::msg::RobotControl::SharedPtr msg) { onRobotControl(*msg); });
+
+        // 全局路径订阅：gimbal_big 跟随路径方向
+        path_sub_ = create_subscription<nav_msgs::msg::Path>(
+            gimbal_follow_path_topic_, 10,
+            [this](const nav_msgs::msg::Path::SharedPtr msg) { onPath(*msg); });
 
         // 创建服务服务器替代话题订阅
         set_posture_service_ = create_service<rm_decision_interfaces::srv::SetSentryPosture>(
@@ -94,7 +108,12 @@ public:
             });
         RCLCPP_INFO(get_logger(), "Service server created: %s", set_posture_service_name_.c_str());
 
+        gimbal_path_timeout_ms_ = declare_parameter<int>("gimbal_path_timeout_ms", 1000);
+
         node_start_ = this->now();
+        last_imu_calibration_time_ = node_start_;
+        last_known_target_.last_update_time = node_start_;
+        last_path_time_ = node_start_;
 
         // 初始化 Chiral 读取器
         auto chiral_reader = talos::chiral::ipc::TalosDataReader::open();
@@ -104,6 +123,11 @@ public:
         } else {
             RCLCPP_WARN(get_logger(), "Failed to initialize chiral reader: %d", static_cast<int>(chiral_reader.error()));
         }
+
+        // Gimbal 路径跟随高频重采样 timer
+        gimbal_path_timer_ = create_wall_timer(
+            std::chrono::milliseconds(20),  // 50Hz
+            [this]() { updateGimbalFromCachedPath(); });
 
         protect_thread_ = std::thread([this]() { protectLoop(); });
         rx_thread_ = std::thread([this]() { rxLoop(); });
@@ -145,6 +169,7 @@ private:
         current_cmd_state_.data.speed_vector.vy = msg.linear.y;
         //current_cmd_state_.data.speed_vector.wz = 0.0;
         current_cmd_state_.data.speed_vector.wz = target_spin_vel_; // 使用来自 RobotControl 消息的旋转速度，而不是 cmd_vel_chassis 的角速度
+
         tx_pending_ = true;
         /*
         RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
@@ -161,9 +186,108 @@ private:
         std::lock_guard<std::mutex> lk(tx_mtx_);
         current_cmd_state_.data.gimbal_big.yaw_vel = msg.gimbal_big_yaw_vel;
         target_spin_vel_ = msg.chassis_spin_vel;
-        gimbal_big_yaw_angle_ = msg.gimbal_big_yaw_angle;
         follow_gimbal_big_ = msg.follow_gimbal_big;
         tx_pending_ = true;
+    }
+
+    void onPath(const nav_msgs::msg::Path& msg)
+    {
+        if (msg.poses.empty()) return;
+        std::lock_guard<std::mutex> lk(path_mtx_);
+        cached_path_ = msg;
+        last_path_time_ = this->now();
+    }
+
+    void updateGimbalFromCachedPath()
+    {
+        // Path 超时检查
+        if ((this->now() - last_path_time_).seconds() * 1000.0 > gimbal_path_timeout_ms_) return;
+
+        nav_msgs::msg::Path local_path;
+        {
+            std::lock_guard<std::mutex> lk(path_mtx_);
+            if (cached_path_.poses.empty()) return;
+            local_path = cached_path_;
+        }
+
+        // 查找 gimbal_yaw_fake 在 map 下的位姿
+        geometry_msgs::msg::TransformStamped tf;
+        try {
+            tf = tf_buffer_->lookupTransform("map", "gimbal_yaw_fake", tf2::TimePointZero);
+        } catch (const tf2::TransformException&) {
+            return;
+        }
+
+        // 找前视点：路径上距机器人 lookahead 距离的点
+        double lookahead = gimbal_follow_lookahead_;
+        bool found = false;
+        double tx, ty;
+
+        for (const auto& pose : local_path.poses) {
+            double px = pose.pose.position.x;
+            double py = pose.pose.position.y;
+
+            // 变换到 chassis 帧
+            double dx = px - tf.transform.translation.x;
+            double dy = py - tf.transform.translation.y;
+            tf2::Quaternion q(tf.transform.rotation.x, tf.transform.rotation.y,
+                              tf.transform.rotation.z, tf.transform.rotation.w);
+            double roll, pitch, yaw;
+            tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
+            double cx = dx * std::cos(yaw) + dy * std::sin(yaw);
+            double cy = -dx * std::sin(yaw) + dy * std::cos(yaw);
+            double dist = std::hypot(cx, cy);
+
+            if (dist >= lookahead) {
+                tx = cx;
+                ty = cy;
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) {
+            // 用路径最后一个点
+            const auto& last = local_path.poses.back().pose.position;
+            double dx = last.x - tf.transform.translation.x;
+            double dy = last.y - tf.transform.translation.y;
+            tf2::Quaternion q(tf.transform.rotation.x, tf.transform.rotation.y,
+                              tf.transform.rotation.z, tf.transform.rotation.w);
+            double roll, pitch, yaw;
+            tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
+            tx = dx * std::cos(yaw) + dy * std::sin(yaw);
+            ty = -dx * std::sin(yaw) + dy * std::cos(yaw);
+        }
+
+        float angle = std::atan2(ty, tx);
+        {
+            std::lock_guard<std::mutex> lk(tx_mtx_);
+            gimbal_big_yaw_angle_ = angle;
+        }
+
+        // 发布 debug marker
+        visualization_msgs::msg::Marker marker;
+        marker.header.stamp = this->now();
+        marker.header.frame_id = "chassis";
+        marker.ns = "expected_gimbal_yaw";
+        marker.id = 0;
+        marker.type = visualization_msgs::msg::Marker::ARROW;
+        marker.action = visualization_msgs::msg::Marker::ADD;
+        marker.pose.position.x = 0.0;
+        marker.pose.position.y = 0.0;
+        marker.pose.position.z = 0.0;
+        tf2::Quaternion mq;
+        mq.setRPY(0, 0, angle);
+        marker.pose.orientation = tf2::toMsg(mq);
+        marker.scale.x = 0.8;  // 箭头长度
+        marker.scale.y = 0.05;
+        marker.scale.z = 0.05;
+        marker.color.r = 1.0f;
+        marker.color.g = 0.0f;
+        marker.color.b = 0.0f;
+        marker.color.a = 1.0f;
+        marker.lifetime = rclcpp::Duration(0, 0);
+        gimbal_yaw_marker_pub_->publish(marker);
     }
 
     void handleSetSentryPosture(
@@ -321,6 +445,13 @@ private:
                     publishRobotLocation(robot_location);
                 }
             }
+            if(hdr.id == rm_sentry_pp::ID_RFID){
+                if(hdr.data_len == sizeof(rm_sentry_pp::ReceiveRfid::data) && frame_len == sizeof(rm_sentry_pp::ReceiveRfid)){
+                    auto rfid = rm_sentry_pp::fromBytes<rm_sentry_pp::ReceiveRfid>(rxbuf.data());
+                    // 发布 rfid 信息
+                    publishRfid(rfid);
+                }
+            }
 
             rxbuf.erase(rxbuf.begin(), rxbuf.begin() + frame_len);
         }
@@ -411,7 +542,8 @@ private:
         robot_status_msg.robot_id = robot_info_data.data.id;
         robot_status_msg.team_color = robot_info_data.data.color;
         robot_status_msg.is_attacked = robot_info_data.data.attacked;
-        robot_status_msg.current_hp = robot_info_data.data.hp;
+        robot_status_msg.current_hp = robot_info_data.data.hp; 
+        robot_status_msg.shot_allowance = robot_info_data.data.shot_allowance; // 17mm 小弹丸 允许发射量
         
         // 发布机器人状态消息
         static auto robot_status_pub = create_publisher<rm_decision_interfaces::msg::RobotStatus>("robot_status", 10);
@@ -478,6 +610,69 @@ private:
         static auto robot_location_pub = create_publisher<rm_decision_interfaces::msg::FriendLocation>("robot_location", 10);
         robot_location_pub->publish(robot_location_msg);
     }
+
+    void publishRfid(const rm_sentry_pp::ReceiveRfid& rfid_msg){
+        auto now = this->now();
+        /*
+        rm_decision_interfaces::msg::RFID rfid_msg;
+        rfid_msg.rfid_status = rfid_data.data.rfid_status;
+        rfid_msg.rfid_status_2 = rfid_data.data.rfid_status_2;
+        */
+        #define GET_BIT(x,n) ((x) >> (n))
+        rm_decision_interfaces::msg::RFIDParse rfid_parse;
+        // ---- 基础点 ----
+        rfid_parse.base_self = GET_BIT(rfid_msg.data.rfid_status , 0);
+        rfid_parse.highland_self = GET_BIT(rfid_msg.data.rfid_status , 1);
+        rfid_parse.highland_enemy  = GET_BIT(rfid_msg.data.rfid_status , 2);
+        rfid_parse.slope_self  = GET_BIT(rfid_msg.data.rfid_status , 3);
+        rfid_parse.slope_enemy  = GET_BIT(rfid_msg.data.rfid_status , 4);
+        // ---- 飞坡 ----
+        rfid_parse.fly_self_front  = GET_BIT(rfid_msg.data.rfid_status , 5);
+        rfid_parse.fly_self_back  = GET_BIT(rfid_msg.data.rfid_status , 6);
+        rfid_parse.fly_enemy_front  = GET_BIT(rfid_msg.data.rfid_status , 7);
+        rfid_parse.fly_enemy_back  = GET_BIT(rfid_msg.data.rfid_status , 8);
+        // ---- 中央高地地形跨越 ----
+        rfid_parse.center_low_self  = GET_BIT(rfid_msg.data.rfid_status , 9);
+        rfid_parse.center_high_self  = GET_BIT(rfid_msg.data.rfid_status , 10);
+        rfid_parse.center_low_enemy  = GET_BIT(rfid_msg.data.rfid_status , 11);
+        rfid_parse.center_high_enemy  = GET_BIT(rfid_msg.data.rfid_status , 12);
+        // ---- 公路 ----
+        rfid_parse.road_low_self  = GET_BIT(rfid_msg.data.rfid_status , 13);
+        rfid_parse.road_high_self  = GET_BIT(rfid_msg.data.rfid_status , 14);
+        rfid_parse.road_low_enemy  = GET_BIT(rfid_msg.data.rfid_status , 15);
+        rfid_parse.road_high_enemy  = GET_BIT(rfid_msg.data.rfid_status , 16);
+        // ---- 战略点 ----
+        rfid_parse.fortress_self  = GET_BIT(rfid_msg.data.rfid_status , 17);
+        rfid_parse.outpost_self  = GET_BIT(rfid_msg.data.rfid_status , 18);
+        rfid_parse.resource_isolated  = GET_BIT(rfid_msg.data.rfid_status , 19);
+        rfid_parse.resource_overlap  = GET_BIT(rfid_msg.data.rfid_status , 20);
+        rfid_parse.supply_self  = GET_BIT(rfid_msg.data.rfid_status , 21);
+        rfid_parse.supply_enemy  = GET_BIT(rfid_msg.data.rfid_status , 22);
+        rfid_parse.center_bonus  = GET_BIT(rfid_msg.data.rfid_status , 23);
+        // ---- 敌方点 ----
+        rfid_parse.fortress_enemy  = GET_BIT(rfid_msg.data.rfid_status , 24);
+        rfid_parse.outpost_enemy  = GET_BIT(rfid_msg.data.rfid_status , 25);
+        // ---- 隧道（己方）----
+        rfid_parse.tunnel_self_1  = GET_BIT(rfid_msg.data.rfid_status , 26);
+        rfid_parse.tunnel_self_2  = GET_BIT(rfid_msg.data.rfid_status , 27);
+        rfid_parse.tunnel_self_3  = GET_BIT(rfid_msg.data.rfid_status , 28);
+        rfid_parse.tunnel_self_4  = GET_BIT(rfid_msg.data.rfid_status , 29);
+        rfid_parse.tunnel_self_5  = GET_BIT(rfid_msg.data.rfid_status , 30);
+        rfid_parse.tunnel_self_6  = GET_BIT(rfid_msg.data.rfid_status , 31);
+        // ---- 隧道（敌方）----
+        rfid_parse.tunnel_enemy_1  = GET_BIT(rfid_msg.data.rfid_status_2 ,0 );
+        rfid_parse.tunnel_enemy_2  = GET_BIT(rfid_msg.data.rfid_status_2 ,1 );
+        rfid_parse.tunnel_enemy_3  = GET_BIT(rfid_msg.data.rfid_status_2 ,2 );
+        rfid_parse.tunnel_enemy_4  = GET_BIT(rfid_msg.data.rfid_status_2 ,3 );
+        rfid_parse.tunnel_enemy_5  = GET_BIT(rfid_msg.data.rfid_status_2 ,4 );
+        rfid_parse.tunnel_enemy_6  = GET_BIT(rfid_msg.data.rfid_status_2 ,5 );
+
+        static auto rfid_pub = create_publisher<rm_decision_interfaces::msg::RFIDParse>("rfid",10);
+        // 发布 rfid 信息
+        rfid_pub->publish(rfid_parse);
+    }
+
+
 
     // 读取线程：定时从 Chiral 读取最新的目标跟踪数据，并发布 ROS 消息
     void chiralLoop()
@@ -979,14 +1174,18 @@ private:
     bool enable_dtr_rts_ { true };
     float target_spin_vel_ = 0.0f;
     int gimbal_angle_timeout_ms_ { 300 };  // gimbal 角度数据超时时间 (ms)
+    std::string gimbal_follow_path_topic_;
+    double gimbal_follow_lookahead_ { 1.5 };
 
     // ros
     rclcpp::Time node_start_;
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
     rclcpp::Publisher<armor_interfaces::msg::Target>::SharedPtr target_tracking_pub_;
+    rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr gimbal_yaw_marker_pub_;
     //rclcpp::Publisher<std_msgs::msg::String>::SharedPtr tracker_status_pub_;
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_chassis_sub_;
     rclcpp::Subscription<rm_decision_interfaces::msg::RobotControl>::SharedPtr robot_control_sub_;
+    rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
     rclcpp::Service<rm_decision_interfaces::srv::SetSentryPosture>::SharedPtr set_posture_service_;
 
     // serial
@@ -1014,6 +1213,13 @@ private:
     float gimbal_big_yaw_angle_ = 0.0f;           // 获得持续发布的角度
     float follow_gimbal_big_ = 0.0f;              // 底盘跟随
     float gimbal_yaw_ = 0.0f;                     // gimbal_yaw 机械角
+
+    // Gimbal path follow - high frequency resampling
+    nav_msgs::msg::Path cached_path_;
+    std::mutex path_mtx_;
+    rclcpp::TimerBase::SharedPtr gimbal_path_timer_;
+    rclcpp::Time last_path_time_;
+    int gimbal_path_timeout_ms_ { 1000 };
 
     // IMU drift correction (protected by tx_mtx_)
     double imu_yaw_offset_ = 0.0;                 // IMU yaw 偏移量（用于修正漂移）

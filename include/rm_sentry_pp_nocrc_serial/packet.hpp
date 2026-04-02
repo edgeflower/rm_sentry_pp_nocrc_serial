@@ -14,6 +14,7 @@ static constexpr uint8_t ID_ROBOT_LOCATION = 0x09;
 static constexpr uint8_t ID_IMU = 0x10;
 static constexpr uint8_t ID_ROBOT_CMD = 0x11;
 static constexpr uint8_t ID_ROBOT_POSTURE = 0x12;
+static constexpr uint8_t ID_RFID = 0x13;
 
 struct HeaderFrame {
     static constexpr uint8_t SoF() { return 0x5A; }
@@ -42,7 +43,8 @@ struct ReceiveRobotInfoData
         bool attacked;  // 是否被击打
         uint16_t hp;    // 机器人剩余血量
         uint16_t heat;  // 机器人枪管热量
-        uint16_t projectile_allowance_17mm; // 17mm弹丸剩余量
+        uint16_t heat_limit; // 机器人热量限制
+        uint16_t shot_allowance; // 17mm弹丸剩余量
         uint16_t posture; // 机器人实际姿态 1=进攻, 2=防御, 3=移动 (下位机控制)
     } data;  // 裁判系统信息
 
@@ -132,7 +134,83 @@ struct ReceiveRobotLocation    // 机器人位置 0x020B
 
 };
 
+struct ReceiveRFID
+{   
+    HeaderFrame frame_header;  // id = 0x13
 
+    uint32_t time_stamp;
+   
+    struct{
+        // ---- 基础点 ----
+        bool base_self;           // bit0 己方基地增益点
+        bool highland_self;       // bit1 己方中央高地增益点
+        bool highland_enemy;      // bit2 对方中央高地增益点
+        bool slope_self;          // bit3 己方梯形高地增益点
+        bool slope_enemy;         // bit4 对方梯形高地增益点
+
+        // ---- 飞坡 ----
+        bool fly_self_front;      // bit5 己方地形跨越增益点（飞坡）（靠近己方一侧飞坡前）
+        bool fly_self_back;       // bit6 己方地形跨越增益点（飞坡）（靠近己方一侧飞坡后）
+        bool fly_enemy_front;     // bit7 对方地形跨越增益点（飞坡）（靠近对方一侧飞坡前）
+        bool fly_enemy_back;      // bit8 对方地形跨越增益点（飞坡）（靠近对方一侧飞坡后）
+
+        // ---- 中央高地地形跨越 ----
+        bool center_low_self;     // bit9  己方地形跨越增益点（中央高地下方）
+        bool center_high_self;    // bit10 己方地形跨越增益点（中央高地上方）
+        bool center_low_enemy;    // bit11 对方地形跨越增益点（中央高地下方）
+        bool center_high_enemy;   // bit12 对方地形跨越增益点（中央高地上方）
+
+        // ---- 公路 ----
+        bool road_low_self;       // bit13 己方地形跨越增益点（公路下方）
+        bool road_high_self;      // bit14 己方地形跨越增益点（公路上方）
+        bool road_low_enemy;      // bit15 对方地形跨越增益点（公路下方）
+        bool road_high_enemy;     // bit16 对方地形跨越增益点（公路上方）
+
+        // ---- 战略点 ----
+        bool fortress_self;       // bit17 己方堡垒增益点
+        bool outpost_self;        // bit18 己方前哨站增益点
+        bool resource_isolated;   // bit19 己方与资源区不重叠的补给区/RMUL 补给区
+        bool resource_overlap;    // bit20 己方与资源区重叠的补给区
+        bool supply_self;         // bit21 己方装配增益点
+        bool supply_enemy;        // bit22 对方装配增益点
+        bool center_bonus;        // bit23 中心增益点（仅 RMUL 适用）
+
+        // ---- 敌方点 ----
+        bool fortress_enemy;      // bit24 对方堡垒增益点
+        bool outpost_enemy;       // bit25 对方前哨站增益点
+
+        // ---- 隧道（己方）----
+        bool tunnel_self_1;       // bit26 己方地形跨越增益点（隧道）（靠近己方一侧公路区下方）
+        bool tunnel_self_2;       // bit27 己方地形跨越增益点（隧道）（靠近己方一侧公路区中间）
+        bool tunnel_self_3;       // bit28 己方地形跨越增益点（隧道）（靠近己方一侧公路区上方）
+        bool tunnel_self_4;       // bit29 己方地形跨越增益点（隧道）（靠近己方梯形高地较低处）
+        bool tunnel_self_5;       // bit30 己方地形跨越增益点（隧道）（靠近己方梯形高地较中间）
+        bool tunnel_self_6;       // bit31 己方地形跨越增益点（隧道）（靠近己方梯形高地较高处）
+
+        // ---- 隧道（敌方）----
+        bool tunnel_enemy_1;      // bit32 对方地形跨越增益点（隧道）（靠近对方公路一侧下方）
+        bool tunnel_enemy_2;      // bit33 对方地形跨越增益点（隧道）（靠近对方公路一侧中间）
+        bool tunnel_enemy_3;      // bit34 对方地形跨越增益点（隧道）（靠近对方公路一侧上方）
+        bool tunnel_enemy_4;      // bit35 对方地形跨越增益点（隧道）（靠近对方梯形高地较低处）
+        bool tunnel_enemy_5;      // bit36 对方地形跨越增益点（隧道）（靠近对方梯形高地较中间）
+        bool tunnel_enemy_6;      // bit37 对方地形跨越增益点（隧道）（靠近对方梯形高地较高处）
+
+    }data;
+
+    uint8_t eof; // 0xA5
+};
+
+struct ReceiveRfid {
+    HeaderFrame frame_header; // id=0x13
+    uint32_t time_stamp;
+
+    struct {
+        uint32_t rfid_status;     // bit0 ~ bit31
+        uint8_t  rfid_status_2;   // bit32 ~ bit39（扩展位）
+    } data;
+
+    uint8_t eof; // 0xA5
+};
 
 struct ReceiveImuData {
     HeaderFrame frame_header; // id=0x10
@@ -141,6 +219,7 @@ struct ReceiveImuData {
     struct {
         uint8_t self_color; // 0=红色，1=蓝色
         float gimbal_yaw; // 小云台机械角 与上电时偏移角度（正中心） 单位 °
+        float chassis_yaw; // 底盘位姿 下位机计算出来的
         float yaw; // rad
         float pitch; // rad
         float roll; // rad
@@ -192,13 +271,15 @@ struct SendRobotPostureData   // 机器人姿态 0x0120
 #pragma pack(pop)
 
 static_assert(sizeof(HeaderFrame) == 3);
-static_assert(sizeof(ReceiveRobotInfoData) == 19);    // 3 + 4 + 12 + 1
+static_assert(sizeof(ReceiveRobotInfoData) == 21);    // 3 + 4 + 14 + 1
 static_assert(sizeof(ReceiveGameStatusData) == 11);   // 3 + 4 + 3 + 1
 static_assert(sizeof(ReceiveAllRobotHpData) == 40);   // 3 + 4 + 33 + 1
 static_assert(sizeof(ReceiveRobotLocation) == 48);    // 3 + 4 + 40 + 1
-static_assert(sizeof(ReceiveImuData) == 37);          // 3 + 4 + 24 + 1
+static_assert(sizeof(ReceiveImuData) == 41);          // 3 + 4 + 28 + 1
 static_assert(sizeof(SendRobotCmdData) == 28);        // 3 + 4 + 16 + 1
 static_assert(sizeof(SendRobotPostureData) == 12);    // 3 + 4 + 6 + 1
+static_assert(sizeof(ReceiveRfid) == 13 );            // 3 + 4 + 38 + 1
+static_assert(sizeof(ReceiveRFID) == 46 );            // 3 + 4 + 5 + 1
 
 template <typename T>
 inline std::vector<uint8_t> toVector(const T& obj)
