@@ -8,3 +8,6 @@ rm_sentry_pp_nocrc_serial:
     imu_topic: gimbal_big/imu
     send_period_ms: 5
     enable_dtr_rts: true
+    gimbal_lookahead_base: 0.8
+    gimbal_lookahead_k: 0.4
+    gimbal_yaw_smooth_alpha: 0.3  # 0=非常平滑/迟缓，1=无滤波

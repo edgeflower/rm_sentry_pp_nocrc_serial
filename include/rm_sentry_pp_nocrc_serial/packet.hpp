@@ -218,9 +218,9 @@ struct ReceiveImuData {
 
     struct {
         uint8_t self_color; // 0=红色，1=蓝色
-        float gimbal_yaw; // 小云台机械角 与上电时偏移角度（正中心） 单位 °
-        float chassis_yaw; // 底盘位姿 下位机计算出来的
-        float yaw; // rad
+        float gimbal_yaw; // 小云台 gimbal_yaw 的机械角 与上电时偏移角度（正中心） 单位 ° ，而不是 gimbal_big 的机械角，gimbal_big 只有 imu 的角度
+        float chassis_yaw; // 底盘位姿 下位机计算出来的 范围 -π ~ π // 这玩意 用不上，先不用
+        float yaw; // rad  这是 gimbal_big 的 imu 角度 ，而 gimbal_yaw的imu 角度 在 视觉给的 imu 信息里
         float pitch; // rad
         float roll; // rad
 

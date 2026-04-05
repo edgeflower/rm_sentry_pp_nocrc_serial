@@ -108,7 +108,7 @@ struct TalosData {
     TargetStateKind state_kind;  // 识别状态
     TargetState state;
 
-    Transform<odom, gimbal> gimbal_link;  // imu   *************
+    Transform<odom, gimbal> gimbal_link;  // imu   ************* // gimbal_yaw 的 imu 角度，当然，只用 yaw 不用别的
     Transform<gimbal, muzzle> muzzle_link;  //枪管
     Transform<gimbal, camera> camera_link;
 };
