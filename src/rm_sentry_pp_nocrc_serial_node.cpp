@@ -1,4 +1,5 @@
 #include "rm_sentry_pp_nocrc_serial/node.hpp"
+#include <rclcpp/logging.hpp>
 
 using namespace std::chrono_literals;
 
@@ -288,7 +289,7 @@ void Node::updateGimbalFromCachedPath()
     if (accumulated < lookahead && target_idx >= N - 1) {
         target_x = local_path.poses.back().pose.position.x;
         target_y = local_path.poses.back().pose.position.y;
-        target_yaw_in_map = extractYaw(local_path.poses.back().pose.orientation); // 这里反而需要直接使用这个角度，map 原始方向就是哨兵原始方向
+        target_yaw_in_map = extractYaw(local_path.poses.back().pose.orientation); // 这里反而需要直接使用这个角度，全局规划器给出的方向是在 哨兵坐标系下的 ，可以直接用
     }
 
 
@@ -302,7 +303,14 @@ void Node::updateGimbalFromCachedPath()
 
         std::lock_guard<std::mutex> lk(tx_mtx_);
         gimbal_yaw_filtered_ = filtered;
-        gimbal_big_yaw_angle_ = filtered;
+        gimbal_big_yaw_angle_ = std::atan2(std::sin(filtered), std::cos(filtered));
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(),
+            *this->get_clock(),
+            1000,   // ms
+            "角度 %f",
+            gimbal_big_yaw_angle_
+        );
         last_gimbal_angle_update_ = this->now();
     }
 
@@ -360,45 +368,52 @@ void Node::updateGimbalFromCachedPath()
 void Node::updateDriftCorrection()
 {
     auto now = this->now();
+
+    // 需要归中参考和 odom 稳定后才开始校正
+    if (!has_imu_centering_ref_ || !odom_stable_) return;
+
     double imu_raw_yaw;
-
     {
         std::lock_guard<std::mutex> lk(tx_mtx_);
-        imu_raw_yaw = latest_imu_raw_yaw_;
+        imu_raw_yaw = std::atan2(std::sin(latest_imu_raw_yaw_), std::cos(latest_imu_raw_yaw_));
     }
 
-    bool tf_ok = false;
-    double new_drift = 0.0;
-
+    double odom_yaw;
     {
-        double cx, cy, chassis_yaw;
-        if (getChassisPoseInMap(cx, cy, chassis_yaw)) {
-            double true_yaw = chassis_yaw;  // chassis ≡ gimbal_big，odom yaw 即真实朝向
-            while (true_yaw > M_PI) true_yaw -= 2 * M_PI;
-            while (true_yaw < -M_PI) true_yaw += 2 * M_PI;
-
-            new_drift = imu_raw_yaw - true_yaw;
-            while (new_drift > M_PI) new_drift -= 2 * M_PI;
-            while (new_drift < -M_PI) new_drift += 2 * M_PI;
-            tf_ok = true;
-            // RCLCPP_INFO(this->get_logger()," gimbal_big 的 补偿 角度 %f", new_drift); // 测试 补偿角度有很大问题，他妈的，利用 imu 的话，这他妈得必须把车头给放正了
-
-        }
+        std::lock_guard<std::mutex> lk(odom_mtx_);
+        if ((now - last_odom_time_).seconds() * 1000.0 > odom_timeout_ms_) return;
+        odom_yaw = cached_odom_yaw_;
     }
 
-    if (tf_ok) {
-        std::lock_guard<std::mutex> lk(tx_mtx_);
-        double dt = (now - last_drift_update_).seconds();
-        if (dt > 0.5) {
-            gimbal_big_drift_rate_ = 0.0;
-        } else if (dt > 0.001) {
-            double rate_raw = (new_drift - gimbal_big_drift_) / dt;
-            gimbal_big_drift_rate_ = 0.8 * gimbal_big_drift_rate_ + 0.2 * rate_raw;
-        }
-        // gimbal_big_drift_ = new_drift;
-        gimbal_big_drift_ = 0.0 ; // 补偿先改为零
-        last_drift_update_ = now;
+    // 补偿量 = (IMU当前 - odom当前) - IMU归中时刻值
+    double compensation = (imu_raw_yaw - odom_yaw) - (imu_at_centering_ - odom_at_centering_);
+    while (compensation > M_PI) compensation -= 2 * M_PI;
+    while (compensation < -M_PI) compensation += 2 * M_PI;
+
+    std::lock_guard<std::mutex> lk(tx_mtx_);
+
+    // 低通滤波
+    double filtered = gimbal_big_drift_ + DRIFT_FILTER_ALPHA * (compensation - gimbal_big_drift_);
+
+    // 更新漂移速率（用于 txLoop 发送间隔插值）
+    double dt = (now - last_drift_update_).seconds();
+    if (dt > 0.5) {
+        gimbal_big_drift_rate_ = 0.0;
+    } else if (dt > 0.001) {
+        double rate_raw = (filtered - gimbal_big_drift_) / dt;
+        rate_raw = std::clamp(rate_raw, -1.0, 1.0);
+        gimbal_big_drift_rate_ = 0.8 * gimbal_big_drift_rate_ + 0.2 * rate_raw;
     }
+
+    gimbal_big_drift_ = std::atan2(std::sin(filtered), std::cos(filtered));
+    last_drift_update_ = now;
+    RCLCPP_INFO_THROTTLE(
+            this->get_logger(),
+            *this->get_clock(),
+            1000,   // ms
+            "偏移纠正角度 %f",
+            gimbal_big_drift_
+        );
 }
 
 void Node::handleSetSentryPosture(
@@ -556,7 +571,9 @@ void Node::publishImu(const rm_sentry_pp::ReceiveImuData& imu_data)
     sensor_msgs::msg::Imu imu;
     imu.header.stamp = now;
     imu.header.frame_id = imu_frame_;
-    gimbal_yaw_ = deg_to_rad_pi(imu_data.data.gimbal_yaw); // 获取gimbal_yaw 的机械角
+    gimbal_big_yaw_ = deg_to_rad_pi(-imu_data.data.chassis_yaw); // 获取gimbal_big 的机械角 因为 chassis_yaw 是 gimbal_big 坐标系下的，所以 加个负号就可以了
+    gimbal_yaw_ = deg_to_rad_pi(imu_data.data.gimbal_yaw); // 获取 gimbal_yaw 的机械角
+
 
     {
         std::lock_guard<std::mutex> lk(tx_mtx_);
@@ -564,14 +581,15 @@ void Node::publishImu(const rm_sentry_pp::ReceiveImuData& imu_data)
 
         bool has_target = last_known_target_.valid.load(std::memory_order_relaxed) &&
                           last_known_target_.confidence.load(std::memory_order_relaxed) > min_confidence_threshold_;
-
+        
+        // gimbal_yaw IMU 漂移修正：当gimbal_yaw 云台回中且没有跟踪目标时，使用机械角校准 IMU   ,这是 gimbal_yaw 的修正，不是  gimbal_big 的
         if (std::abs(gimbal_yaw_) < IMU_CALIBRATION_THRESHOLD &&
             !has_target &&
             !is_calibrating_imu_ &&
             (now - last_imu_calibration_time_).seconds() > IMU_CALIBRATION_INTERVAL) {
 
-            double imu_yaw = target_gimbal_big_yaw_angle_;
-            imu_yaw_offset_ = imu_yaw - gimbal_yaw_;
+            double imu_yaw = target_gimbal_yaw_angle_;  // 这是 获取的 gimbal_yaw 的 yaw 值
+            imu_yaw_offset_ = imu_yaw - gimbal_yaw_; // 这是 imu 的 yaw值 减去 gimbal_yaw 的 机械角 
             is_calibrating_imu_ = true;
             last_imu_calibration_time_ = now;
 
@@ -582,12 +600,25 @@ void Node::publishImu(const rm_sentry_pp::ReceiveImuData& imu_data)
         if (has_target) {
             is_calibrating_imu_ = false;
         }
+
+        // gimbal_big 漂移校正：检测归中时刻，记录 IMU 参考值
+        if (!has_imu_centering_ref_ && std::abs(gimbal_big_yaw_) < IMU_CALIBRATION_THRESHOLD ) {
+            imu_at_centering_ = imu_data.data.yaw;
+            double odom_yaw_copy;
+            {
+                std::lock_guard<std::mutex> lk(odom_mtx_);
+                odom_yaw_copy = cached_odom_yaw_;
+            }
+            odom_at_centering_ = odom_yaw_copy;
+            has_imu_centering_ref_ = true;
+            RCLCPP_INFO(get_logger(), "Gimbal_big centering detected: imu_at_centering=%.4f rad", imu_at_centering_);
+        }
     }
 
-    double corrected_yaw = imu_data.data.yaw - imu_yaw_offset_;
+    // double corrected_yaw = imu_data.data.yaw - imu_yaw_offset_;
 
     tf2::Quaternion q;
-    q.setRPY(imu_data.data.roll, imu_data.data.pitch, corrected_yaw);
+    q.setRPY(imu_data.data.roll, imu_data.data.pitch, imu_data.data.yaw);
     imu.orientation = tf2::toMsg(q);
 
     imu.angular_velocity.x = imu_data.data.roll_vel;
@@ -800,7 +831,8 @@ void Node::publishTargetTracking(const talos::chrial::TalosData& talos_data)
         while (yaw_from_tf > M_PI) yaw_from_tf -= 2 * M_PI;
         while (yaw_from_tf < -M_PI) yaw_from_tf += 2 * M_PI;
         std::lock_guard<std::mutex> lk(tx_mtx_);
-        target_gimbal_big_yaw_angle_ = static_cast<float>(yaw_from_tf);
+        target_gimbal_yaw_angle_ = static_cast<float>(yaw_from_tf);
+        imu_data_cached = static_cast<float>(yaw_from_tf);
         last_gimbal_angle_update_ = now;
     }
 
@@ -1082,6 +1114,15 @@ void Node::onOdom(const nav_msgs::msg::Odometry& msg)
     cached_odom_vx_ = msg.twist.twist.linear.x;
     cached_odom_vy_ = msg.twist.twist.linear.y;
     last_odom_time_ = this->now();
+
+    // odom 稳定检测
+    if (!odom_stable_) {
+        odom_stable_count_++;
+        if (odom_stable_count_ >= ODOM_STABLE_REQUIRED) {
+            odom_stable_ = true;
+            RCLCPP_INFO(get_logger(), "Odometry stabilized after %d frames", odom_stable_count_);
+        }
+    }
 }
 
 bool Node::getChassisPoseInMap(double& x, double& y, double& yaw)

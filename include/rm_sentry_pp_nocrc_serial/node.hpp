@@ -149,11 +149,12 @@ private:
     rm_sentry_pp::SendRobotPostureData current_robot_posture_state_;
 
     // Gimbal angle follow data (protected by tx_mtx_)
-    float target_gimbal_big_yaw_angle_ = 0.0f;
+    float target_gimbal_yaw_angle_ = 0.0f;
     rclcpp::Time last_gimbal_angle_update_;
     float gimbal_big_yaw_angle_ = 0.0f;
     float follow_gimbal_big_ = 0.0f;
     float gimbal_yaw_ = 0.0f;
+
 
     // Gimbal path follow - high frequency resampling
     nav_msgs::msg::Path cached_path_;
@@ -172,6 +173,7 @@ private:
     double imu_yaw_offset_ = 0.0;
     bool is_calibrating_imu_ = false;
     rclcpp::Time last_imu_calibration_time_;
+    float imu_data_cached;  // imu 一上电位姿
     static constexpr double IMU_CALIBRATION_THRESHOLD = 0.05;
     static constexpr double IMU_CALIBRATION_INTERVAL = 2.0;
 
@@ -179,6 +181,16 @@ private:
     double gimbal_big_drift_ = 0.0;
     double gimbal_big_drift_rate_ = 0.0;
     rclcpp::Time last_drift_update_;
+    float gimbal_big_yaw_;
+
+    // Drift calibration state
+    bool has_imu_centering_ref_ = false;
+    double imu_at_centering_ = 0.0;
+    double odom_at_centering_  = 0.0;
+    bool odom_stable_ = false;
+    int odom_stable_count_ = 0;
+    static constexpr int ODOM_STABLE_REQUIRED = 50;  // 50帧 (~5s@10Hz)
+    static constexpr double DRIFT_FILTER_ALPHA = 0.15;
 
     bool tx_pending_ { false };
     bool tx_posture_pending_ { false };
