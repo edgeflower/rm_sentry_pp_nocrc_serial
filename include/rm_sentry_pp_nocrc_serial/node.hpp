@@ -6,6 +6,7 @@
 #include <nav_msgs/msg/path.hpp>
 #include <rclcpp/publisher_base.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <rm_decision_interfaces/msg/detail/enemy_location__struct.hpp>
 #include <rm_decision_interfaces/msg/detail/sentry_posture_status__struct.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <visualization_msgs/msg/marker.hpp>
@@ -41,7 +42,7 @@
 #include <rm_decision_interfaces/msg/robot_status.hpp>
 #include<rm_decision_interfaces/msg/rfid.hpp>
 #include<rm_decision_interfaces/msg/rfid_parse.hpp>
-
+#include<rm_decision_interfaces/msg/enemy_location.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 
 namespace rm_sentry_pp_nocrc_serial {
@@ -82,6 +83,7 @@ private:
     void publishAllRobotHp(const rm_sentry_pp::ReceiveAllRobotHpData& all_robot_hp_data);
     void publishRobotLocation(const rm_sentry_pp::ReceiveRobotLocation& robot_location_data);
     void publishRfid(const rm_sentry_pp::ReceiveRfid& rfid_msg);
+    void publishEnemyLocation(const rm_sentry_pp::ReceiveEnemyLocation& enemy_location_data);
 
     void publishTargetTracking(const talos::chrial::TalosData& talos_data);
 
@@ -106,6 +108,7 @@ private:
     double gimbal_lookahead_base_ { 0.8 };
     double gimbal_lookahead_k_ { 0.4 };
     double gimbal_yaw_smooth_alpha_ { 0.3 };
+    bool nav_status_;
 
     // Odometry parameters
     std::string odom_topic_;
@@ -129,6 +132,7 @@ private:
     rclcpp::Publisher<rm_decision_interfaces::msg::AllRobotHP>::SharedPtr all_robot_hp_pub_;
     rclcpp::Publisher<rm_decision_interfaces::msg::FriendLocation>::SharedPtr robot_location_pub_;
     rclcpp::Publisher<rm_decision_interfaces::msg::RFIDParse>::SharedPtr rfid_pub_;
+    rclcpp::Publisher<rm_decision_interfaces::msg::EnemyLocation>::SharedPtr enemy_location_pub_;
 
     // serial
     SerialPort sp_;
@@ -152,8 +156,9 @@ private:
     float target_gimbal_yaw_angle_ = 0.0f;
     rclcpp::Time last_gimbal_angle_update_;
     float gimbal_big_yaw_angle_ = 0.0f;
-    float follow_gimbal_big_ = 0.0f;
+    bool follow_gimbal_big_ = false;
     float gimbal_yaw_ = 0.0f;
+    bool track_status_ = false;
 
 
     // Gimbal path follow - high frequency resampling

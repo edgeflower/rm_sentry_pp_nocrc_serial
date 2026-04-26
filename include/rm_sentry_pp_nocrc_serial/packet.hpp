@@ -1,4 +1,5 @@
 #pragma once
+#include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -15,6 +16,7 @@ static constexpr uint8_t ID_IMU = 0x10;
 static constexpr uint8_t ID_ROBOT_CMD = 0x11;
 static constexpr uint8_t ID_ROBOT_POSTURE = 0x12;
 static constexpr uint8_t ID_RFID = 0x13;
+static constexpr uint8_t ID_ENEMY_LOCATION = 0x14;
 
 struct HeaderFrame {
     static constexpr uint8_t SoF() { return 0x5A; }
@@ -46,6 +48,7 @@ struct ReceiveRobotInfoData
         uint16_t heat_limit; // 机器人热量限制
         uint16_t shot_allowance; // 17mm弹丸剩余量
         uint16_t posture; // 机器人实际姿态 1=进攻, 2=防御, 3=移动 (下位机控制)
+        bool nav_status; // 机器人初始化状态 false 未初始化， true 已初始化
     } data;  // 裁判系统信息
 
     uint8_t eof; // 0xA5
@@ -199,7 +202,28 @@ struct ReceiveRFID
 
     uint8_t eof; // 0xA5
 };
+struct ReceiveEnemyLocation {
+    
+    HeaderFrame frame_header;  // id = 0x14
 
+    uint32_t time_stamp;
+   
+    struct {
+          float hero_x;   
+          float hero_y;  
+          float engineer_x;  
+          float engineer_y;  
+          float standard_3_x;  // 3号步兵位置
+          float standard_3_y;  
+          float standard_4_x;  // 4号步兵位置
+          float standard_4_y;  
+          float sentry_x;  // 哨兵位置
+          float sentry_y;  // 哨兵位置
+
+    } enemy;
+
+    uint8_t eof; // 0xA5
+};
 struct ReceiveRfid {
     HeaderFrame frame_header; // id=0x13
     uint32_t time_stamp;
@@ -259,9 +283,9 @@ struct SendRobotPostureData   // 机器人姿态 0x0120
 
     struct
     {
-        uint16_t posture; // 机器人姿态    1 进攻 、2 防御 、 3 移动
-        uint16_t follow_gimbal_big; // 是否跟随大云台 0 不跟随 1 跟随  //底盘跟随
-        //uint16_t track_status;      // 是否启动履带 0 不启动 1 启动
+        uint8_t posture; // 机器人姿态    1 进攻 、2 防御 、 3 移动
+        bool follow_gimbal_big; // 是否跟随大云台 0 不跟随 1 跟随  //底盘跟随
+        bool track_status;      // 是否启动履带 0 不启动 1 启动
     } data;
 
     uint8_t eof; // 0xA5
@@ -271,15 +295,16 @@ struct SendRobotPostureData   // 机器人姿态 0x0120
 #pragma pack(pop)
 
 static_assert(sizeof(HeaderFrame) == 3);
-static_assert(sizeof(ReceiveRobotInfoData) == 21);    // 3 + 4 + 14 + 1
+static_assert(sizeof(ReceiveRobotInfoData) == 22);    // 3 + 4 + 15 + 1
 static_assert(sizeof(ReceiveGameStatusData) == 11);   // 3 + 4 + 3 + 1
 static_assert(sizeof(ReceiveAllRobotHpData) == 40);   // 3 + 4 + 33 + 1
 static_assert(sizeof(ReceiveRobotLocation) == 48);    // 3 + 4 + 40 + 1
 static_assert(sizeof(ReceiveImuData) == 41);          // 3 + 4 + 28 + 1
 static_assert(sizeof(SendRobotCmdData) == 28);        // 3 + 4 + 16 + 1
-static_assert(sizeof(SendRobotPostureData) == 12);    // 3 + 4 + 6 + 1
+static_assert(sizeof(SendRobotPostureData) == 11);    // 3 + 4 + 3 + 1
 static_assert(sizeof(ReceiveRfid) == 13 );            // 3 + 4 + 38 + 1
 static_assert(sizeof(ReceiveRFID) == 46 );            // 3 + 4 + 5 + 1
+static_assert(sizeof(ReceiveEnemyLocation) == 48);    // 3 + 4 + 5 + 1
 
 template <typename T>
 inline std::vector<uint8_t> toVector(const T& obj)

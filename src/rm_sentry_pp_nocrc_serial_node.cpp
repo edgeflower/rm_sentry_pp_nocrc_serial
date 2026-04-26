@@ -1,5 +1,7 @@
 #include "rm_sentry_pp_nocrc_serial/node.hpp"
+#include "rm_sentry_pp_nocrc_serial/packet.hpp"
 #include <rclcpp/logging.hpp>
+#include <rm_decision_interfaces/msg/detail/enemy_location__struct.hpp>
 
 using namespace std::chrono_literals;
 
@@ -100,6 +102,8 @@ Node::Node(const rclcpp::NodeOptions& options)
     // rfid 信息
     rfid_pub_ = create_publisher<rm_decision_interfaces::msg::RFIDParse>("rfid",10);
 
+    // 敌方机器人位置
+    enemy_location_pub_ = create_publisher<rm_decision_interfaces::msg::EnemyLocation>("enemy_location",10);
     // 创建服务服务器替代话题订阅
     set_posture_service_ = create_service<rm_decision_interfaces::srv::SetSentryPosture>(
         set_posture_service_name_,
@@ -185,6 +189,7 @@ void Node::onRobotControl(const rm_decision_interfaces::msg::RobotControl& msg)
     current_cmd_state_.data.gimbal_big.yaw_vel = msg.gimbal_big_yaw_vel;
     target_spin_vel_ = msg.chassis_spin_vel;
     follow_gimbal_big_ = msg.follow_gimbal_big;
+    track_status_ = msg.track_status;
     tx_pending_ = true;
 }
 
@@ -526,6 +531,7 @@ void Node::parseFrames(std::vector<uint8_t>& rxbuf)
         if(hdr.id == rm_sentry_pp::ID_ROBOT_INFO){
             if(hdr.data_len == sizeof(rm_sentry_pp::ReceiveRobotInfoData::data) && frame_len == sizeof(rm_sentry_pp::ReceiveRobotInfoData)){
                 auto robot_info = rm_sentry_pp::fromBytes<rm_sentry_pp::ReceiveRobotInfoData>(rxbuf.data());
+                nav_status_ = robot_info.data.nav_status;
                 publishRobotInfo(robot_info);
             }
         }
@@ -551,6 +557,12 @@ void Node::parseFrames(std::vector<uint8_t>& rxbuf)
             if(hdr.data_len == sizeof(rm_sentry_pp::ReceiveRfid::data) && frame_len == sizeof(rm_sentry_pp::ReceiveRfid)){
                 auto rfid = rm_sentry_pp::fromBytes<rm_sentry_pp::ReceiveRfid>(rxbuf.data());
                 publishRfid(rfid);
+            }
+        }
+        if(hdr.id == rm_sentry_pp::ID_ENEMY_LOCATION){
+            if(hdr.data_len == sizeof(rm_sentry_pp::ReceiveEnemyLocation::enemy) && frame_len == sizeof(rm_sentry_pp::ReceiveEnemyLocation)){
+                auto enemy_location = rm_sentry_pp::fromBytes<rm_sentry_pp::ReceiveEnemyLocation>(rxbuf.data());
+                publishEnemyLocation(enemy_location);
             }
         }
 
@@ -579,30 +591,30 @@ void Node::publishImu(const rm_sentry_pp::ReceiveImuData& imu_data)
         std::lock_guard<std::mutex> lk(tx_mtx_);
         latest_imu_raw_yaw_ = imu_data.data.yaw;
 
-        bool has_target = last_known_target_.valid.load(std::memory_order_relaxed) &&
-                          last_known_target_.confidence.load(std::memory_order_relaxed) > min_confidence_threshold_;
-        
+        // bool has_target = last_known_target_.valid.load(std::memory_order_relaxed) &&
+        //                   last_known_target_.confidence.load(std::memory_order_relaxed) > min_confidence_threshold_;
+        // 
         // gimbal_yaw IMU 漂移修正：当gimbal_yaw 云台回中且没有跟踪目标时，使用机械角校准 IMU   ,这是 gimbal_yaw 的修正，不是  gimbal_big 的
-        if (std::abs(gimbal_yaw_) < IMU_CALIBRATION_THRESHOLD &&
-            !has_target &&
-            !is_calibrating_imu_ &&
-            (now - last_imu_calibration_time_).seconds() > IMU_CALIBRATION_INTERVAL) {
+        // if (std::abs(gimbal_yaw_) < IMU_CALIBRATION_THRESHOLD &&
+        //     !has_target &&
+        //     !is_calibrating_imu_ &&
+        //     (now - last_imu_calibration_time_).seconds() > IMU_CALIBRATION_INTERVAL) {
 
-            double imu_yaw = target_gimbal_yaw_angle_;  // 这是 获取的 gimbal_yaw 的 yaw 值
-            imu_yaw_offset_ = imu_yaw - gimbal_yaw_; // 这是 imu 的 yaw值 减去 gimbal_yaw 的 机械角 
-            is_calibrating_imu_ = true;
-            last_imu_calibration_time_ = now;
+        //     double imu_yaw = target_gimbal_yaw_angle_;  // 这是 获取的 gimbal_yaw 的 yaw 值
+        //     imu_yaw_offset_ = imu_yaw - gimbal_yaw_; // 这是 imu 的 yaw值 减去 gimbal_yaw 的 机械角 
+        //     is_calibrating_imu_ = true;
+        //     last_imu_calibration_time_ = now;
 
-            RCLCPP_DEBUG(get_logger(), "IMU calibrated: offset=%.3f rad (gimbal_yaw=%.3f, imu_yaw=%.3f)",
-                        imu_yaw_offset_, gimbal_yaw_, imu_yaw);
-        }
+        //     RCLCPP_DEBUG(get_logger(), "IMU calibrated: offset=%.3f rad (gimbal_yaw=%.3f, imu_yaw=%.3f)",
+        //                 imu_yaw_offset_, gimbal_yaw_, imu_yaw);
+        // }
 
-        if (has_target) {
-            is_calibrating_imu_ = false;
-        }
+        // if (has_target) {
+        //     is_calibrating_imu_ = false;
+        // }
 
         // gimbal_big 漂移校正：检测归中时刻，记录 IMU 参考值
-        if (!has_imu_centering_ref_ && std::abs(gimbal_big_yaw_) < IMU_CALIBRATION_THRESHOLD ) {
+        if (!has_imu_centering_ref_ && std::abs(gimbal_big_yaw_) < IMU_CALIBRATION_THRESHOLD && nav_status_) {
             imu_at_centering_ = imu_data.data.yaw;
             double odom_yaw_copy;
             {
@@ -616,7 +628,7 @@ void Node::publishImu(const rm_sentry_pp::ReceiveImuData& imu_data)
     }
 
     // double corrected_yaw = imu_data.data.yaw - imu_yaw_offset_;
-
+    /*
     tf2::Quaternion q;
     q.setRPY(imu_data.data.roll, imu_data.data.pitch, imu_data.data.yaw);
     imu.orientation = tf2::toMsg(q);
@@ -624,7 +636,7 @@ void Node::publishImu(const rm_sentry_pp::ReceiveImuData& imu_data)
     imu.angular_velocity.x = imu_data.data.roll_vel;
     imu.angular_velocity.y = imu_data.data.pitch_vel;
     imu.angular_velocity.z = imu_data.data.yaw_vel;
-    imu_pub_->publish(imu);
+    imu_pub_->publish(imu);*/
 }
 
 void Node::publishRobotInfo(const rm_sentry_pp::ReceiveRobotInfoData& robot_info_data)
@@ -694,10 +706,28 @@ void Node::publishRobotLocation(const rm_sentry_pp::ReceiveRobotLocation& robot_
     robot_location_msg.standard_3_y = robot_location_data.data.standard_3_y;
     robot_location_msg.standard_4_x = robot_location_data.data.standard_4_x;
     robot_location_msg.standard_4_y = robot_location_data.data.standard_4_y;
-    robot_location_msg.standard_5_x = robot_location_data.data.sentry_x;
-    robot_location_msg.standard_5_y = robot_location_data.data.sentry_y;
+    robot_location_msg.sentry_x = robot_location_data.data.sentry_x;
+    robot_location_msg.sentry_y = robot_location_data.data.sentry_y;
 
     robot_location_pub_->publish(robot_location_msg);
+}
+
+void Node::publishEnemyLocation(const rm_sentry_pp::ReceiveEnemyLocation& enemy_location_data)
+{
+    auto now = this->now();
+    rm_decision_interfaces::msg::EnemyLocation enemy_location_msg;
+    enemy_location_msg.hero_x = enemy_location_data.enemy.hero_x;
+    enemy_location_msg.hero_y = enemy_location_data.enemy.hero_y;
+    enemy_location_msg.engineer_x = enemy_location_data.enemy.engineer_x;
+    enemy_location_msg.engineer_y = enemy_location_data.enemy.engineer_y;
+    enemy_location_msg.standard_3_x = enemy_location_data.enemy.standard_3_x;
+    enemy_location_msg.standard_3_y = enemy_location_data.enemy.standard_3_y;
+    enemy_location_msg.standard_4_x = enemy_location_data.enemy.standard_4_x;
+    enemy_location_msg.standard_4_y = enemy_location_data.enemy.standard_4_y;
+    enemy_location_msg.sentry_x = enemy_location_data.enemy.sentry_x;
+    enemy_location_msg.sentry_y = enemy_location_data.enemy.sentry_y;
+
+    enemy_location_pub_->publish(enemy_location_msg);
 }
 
 void Node::publishRfid(const rm_sentry_pp::ReceiveRfid& rfid_msg){
@@ -781,76 +811,105 @@ void Node::publishTargetTracking(const talos::chrial::TalosData& talos_data)
     target_msg.header.stamp = now;
     target_msg.header.frame_id = "map";
 
+    // ===============================
+    // 1. 先处理追踪状态
+    // ===============================
     switch (talos_data.state.status) {
         case talos::chrial::TrackerStatus::Idle:
             target_msg.tracking = false;
             target_msg.tracking_status = 0;
+            target_msg.confidence = 0.0;
+
             last_known_target_.valid.store(false, std::memory_order_relaxed);
             last_known_target_.confidence.store(0.0, std::memory_order_relaxed);
             break;
+
         case talos::chrial::TrackerStatus::Detecting:
             target_msg.tracking = false;
             target_msg.tracking_status = 1;
-            if (last_known_target_.valid) {
-                double time_since_last = (now - last_known_target_.last_update_time).seconds();
+
+            if (last_known_target_.valid.load(std::memory_order_relaxed)) {
+                double time_since_last =
+                    (now - last_known_target_.last_update_time).seconds();
+
+                double decayed_confidence = calculateDecayedConfidence(
+                    last_known_target_.confidence.load(std::memory_order_relaxed),
+                    time_since_last);
+
                 last_known_target_.confidence.store(
-                    calculateDecayedConfidence(last_known_target_.confidence.load(std::memory_order_relaxed), time_since_last),
+                    decayed_confidence,
                     std::memory_order_relaxed);
             }
-            target_msg.confidence = last_known_target_.confidence.load(std::memory_order_relaxed);
+
+            target_msg.confidence =
+                last_known_target_.confidence.load(std::memory_order_relaxed);
             break;
+
         case talos::chrial::TrackerStatus::Tracking:
             target_msg.tracking = true;
             target_msg.tracking_status = 2;
             target_msg.confidence = 1.0;
             break;
+
         case talos::chrial::TrackerStatus::TempLost:
             target_msg.tracking = false;
             target_msg.tracking_status = 3;
+
             if (last_known_target_.valid.load(std::memory_order_relaxed)) {
-                double time_since_last = (now - last_known_target_.last_update_time).seconds();
+                double time_since_last =
+                    (now - last_known_target_.last_update_time).seconds();
+
+                double decayed_confidence = calculateDecayedConfidence(
+                    last_known_target_.confidence.load(std::memory_order_relaxed),
+                    time_since_last);
+
                 last_known_target_.confidence.store(
-                    calculateDecayedConfidence(last_known_target_.confidence.load(std::memory_order_relaxed), time_since_last),
+                    decayed_confidence,
                     std::memory_order_relaxed);
-                target_msg.confidence = last_known_target_.confidence.load(std::memory_order_relaxed);
+
+                target_msg.confidence = decayed_confidence;
             } else {
                 target_msg.confidence = 0.0;
             }
             break;
     }
 
-    {
-        tf2::Quaternion q_yaw_to_big(
-            talos_data.gimbal_link.rotation.x,
-            talos_data.gimbal_link.rotation.y,
-            talos_data.gimbal_link.rotation.z,
-            talos_data.gimbal_link.rotation.w
-        );
-        double r_unused, p_unused, yaw_from_tf;
-        tf2::Matrix3x3(q_yaw_to_big).getRPY(r_unused, p_unused, yaw_from_tf);
-        while (yaw_from_tf > M_PI) yaw_from_tf -= 2 * M_PI;
-        while (yaw_from_tf < -M_PI) yaw_from_tf += 2 * M_PI;
-        std::lock_guard<std::mutex> lk(tx_mtx_);
-        target_gimbal_yaw_angle_ = static_cast<float>(yaw_from_tf);
-        imu_data_cached = static_cast<float>(yaw_from_tf);
-        last_gimbal_angle_update_ = now;
-    }
-
+    // ===============================
+    // 2. 如果当前正在追踪目标，使用视觉实时数据
+    // ===============================
     if (talos_data.state.status == talos::chrial::TrackerStatus::Tracking) {
-        double enemy_x, enemy_y, enemy_z;
-        double enemy_vx = 0, enemy_vy = 0, enemy_vz = 0;
+        double enemy_x = 0.0;
+        double enemy_y = 0.0;
+        double enemy_z = 0.0;
 
+        double enemy_vx = 0.0;
+        double enemy_vy = 0.0;
+        double enemy_vz = 0.0;
+
+        // -------------------------------
+        // 2.1 读取视觉给出的敌人位置
+        //
+        // 这里你已经确认：
+        // 视觉给的是 ROS 坐标系下，敌人相对于 gimbal_yaw 的位置
+        //
+        // 即：
+        // x：云台当前朝向前方
+        // y：云台左侧
+        // z：上方
+        // -------------------------------
         if (talos_data.state_kind == talos::chrial::TargetStateKind::Robot) {
             enemy_x = talos_data.state.robot.position.x;
             enemy_y = talos_data.state.robot.position.y;
-            enemy_z = 0.0;
+            enemy_z = talos_data.state.robot.position.z;
+
             enemy_vx = talos_data.state.robot.velocity.x;
             enemy_vy = talos_data.state.robot.velocity.y;
             enemy_vz = talos_data.state.robot.velocity.z;
         } else if (talos_data.state_kind == talos::chrial::TargetStateKind::Outpost) {
             enemy_x = talos_data.state.outpost.position.x;
             enemy_y = talos_data.state.outpost.position.y;
-            enemy_z = 0.0;
+            enemy_z = talos_data.state.outpost.position.z;
+
             enemy_vx = talos_data.state.outpost.velocity.x;
             enemy_vy = talos_data.state.outpost.velocity.y;
             enemy_vz = talos_data.state.outpost.velocity.z;
@@ -859,79 +918,158 @@ void Node::publishTargetTracking(const talos::chrial::TalosData& talos_data)
             return;
         }
 
+        // 敌人在 gimbal_yaw 坐标系下的位置向量
         tf2::Vector3 enemy_gimbal_yaw(enemy_x, enemy_y, enemy_z);
+
+        // 敌人在 gimbal_yaw 坐标系下的速度向量
         tf2::Vector3 velocity_gimbal_yaw(enemy_vx, enemy_vy, enemy_vz);
 
-        tf2::Quaternion q_yaw_to_big(
-            talos_data.gimbal_link.rotation.x,
-            talos_data.gimbal_link.rotation.y,
-            talos_data.gimbal_link.rotation.z,
-            talos_data.gimbal_link.rotation.w
-        );
-        tf2::Vector3 enemy_gimbal_big = tf2::quatRotate(q_yaw_to_big, enemy_gimbal_yaw);
-        tf2::Vector3 velocity_gimbal_big = tf2::quatRotate(q_yaw_to_big, velocity_gimbal_yaw);
-
+        // ===============================
+        // 3. 获取 gimbal_yaw 相对于 gimbal_big 的机械角
+        // ===============================
+        double gimbal_yaw_now = 0.0;
         {
-            double chassis_x, chassis_y, chassis_yaw;
-            if (!getChassisPoseInMap(chassis_x, chassis_y, chassis_yaw)) {
-                target_tracking_pub_->publish(target_msg);
-                return;
-            }
+            std::lock_guard<std::mutex> lk(tx_mtx_);
 
-            double gimbal_big_yaw = chassis_yaw;  // chassis ≡ gimbal_big，odom yaw 即真实朝向
-            while (gimbal_big_yaw > M_PI) gimbal_big_yaw -= 2 * M_PI;
-            while (gimbal_big_yaw < -M_PI) gimbal_big_yaw += 2 * M_PI;
-
-            tf2::Quaternion q_map_to_big;
-            q_map_to_big.setRPY(0, 0, gimbal_big_yaw);
-            tf2::Vector3 t_map_to_big(chassis_x, chassis_y, 0);
-
-            tf2::Vector3 enemy_map_rotated = tf2::quatRotate(q_map_to_big, enemy_gimbal_big);
-            tf2::Vector3 enemy_map = enemy_map_rotated + t_map_to_big;
-            tf2::Vector3 velocity_map = tf2::quatRotate(q_map_to_big, velocity_gimbal_big);
-
-            target_msg.position.x = enemy_map.x();
-            target_msg.position.y = enemy_map.y();
-            target_msg.position.z = enemy_map.z();
-            target_msg.velocity.x = velocity_map.x();
-            target_msg.velocity.y = velocity_map.y();
-            target_msg.velocity.z = velocity_map.z();
-
-            const double CHASSIS_RESPONSE_DELAY = 0.2;
-            double predicted_x = enemy_map.x() + velocity_map.x() * CHASSIS_RESPONSE_DELAY;
-            double predicted_y = enemy_map.y() + velocity_map.y() * CHASSIS_RESPONSE_DELAY;
-            double predicted_z = 0.0;
-
-            last_known_target_.valid.store(true, std::memory_order_relaxed);
-            last_known_target_.last_update_time = now;
-            last_known_target_.position_x = enemy_map.x();
-            last_known_target_.position_y = enemy_map.y();
-            last_known_target_.position_z = enemy_map.z();
-            last_known_target_.velocity_x = velocity_map.x();
-            last_known_target_.velocity_y = velocity_map.y();
-            last_known_target_.velocity_z = velocity_map.z();
-            last_known_target_.predicted_x = predicted_x;
-            last_known_target_.predicted_y = predicted_y;
-            last_known_target_.predicted_z = predicted_z;
-            last_known_target_.confidence.store(1.0, std::memory_order_relaxed);
-
-            RCLCPP_DEBUG(get_logger(), "Target predicted: pos=(%.2f, %.2f) -> pred=(%.2f, %.2f)",
-                        enemy_map.x(), enemy_map.y(), predicted_x, predicted_y);
+            // gimbal_yaw_ 是下位机给的机械角
+            // 机器人归中时为 0°
+            // 这里已经在 publishImu() 中转成了弧度
+            gimbal_yaw_now = gimbal_yaw_;
         }
-    } else if (talos_data.state.status == talos::chrial::TrackerStatus::TempLost &&
-               last_known_target_.valid.load(std::memory_order_relaxed) &&
-               last_known_target_.confidence.load(std::memory_order_relaxed) > min_confidence_threshold_) {
-        target_msg.position.x = last_known_target_.predicted_x;
-        target_msg.position.y = last_known_target_.predicted_y;
-        target_msg.position.z = last_known_target_.predicted_z;
+
+        // -------------------------------
+        // 这里定义的是：
+        //
+        // gimbal_big -> gimbal_yaw
+        //
+        // 也就是说：
+        // 在 gimbal_big 看来，gimbal_yaw 转了 gimbal_yaw_now
+        // -------------------------------
+        tf2::Quaternion q_big_to_yaw;
+        q_big_to_yaw.setRPY(0.0, 0.0, gimbal_yaw_now);
+
+        // -------------------------------
+        // 但是现在 enemy_gimbal_yaw 是在 gimbal_yaw 坐标系下的点
+        //
+        // 我们要把它变成 gimbal_big 坐标系下的点：
+        //
+        // gimbal_yaw -> gimbal_big
+        //
+        // 所以要用 inverse()
+        // -------------------------------
+        tf2::Vector3 enemy_gimbal_big =
+            tf2::quatRotate(q_big_to_yaw.inverse(), enemy_gimbal_yaw);
+
+        tf2::Vector3 velocity_gimbal_big =
+            tf2::quatRotate(q_big_to_yaw.inverse(), velocity_gimbal_yaw);
+
+        // ===============================
+        // 4. 获取 gimbal_big / chassis 在 map 下的位置和角度
+        // ===============================
+        double chassis_x = 0.0;
+        double chassis_y = 0.0;
+        double chassis_yaw = 0.0;
+
+        if (!getChassisPoseInMap(chassis_x, chassis_y, chassis_yaw)) {
+            target_tracking_pub_->publish(target_msg);
+            return;
+        }
+
+        // -------------------------------
+        // 你的系统里：
+        //
+        // gimbal_big ≈ chassis
+        //
+        // 所以 chassis_yaw 就是 gimbal_big 在 map 下的 yaw
+        // -------------------------------
+        tf2::Quaternion q_map_to_big;
+        q_map_to_big.setRPY(0.0, 0.0, chassis_yaw);
+
+        tf2::Vector3 t_map_to_big(chassis_x, chassis_y, 0.0);
+
+        // -------------------------------
+        // 把敌人从 gimbal_big 坐标系转到 map 坐标系
+        //
+        // enemy_map = R(map <- gimbal_big) * enemy_gimbal_big + 平移
+        // -------------------------------
+        tf2::Vector3 enemy_map =
+            tf2::quatRotate(q_map_to_big, enemy_gimbal_big) + t_map_to_big;
+
+        tf2::Vector3 velocity_map =
+            tf2::quatRotate(q_map_to_big, velocity_gimbal_big);
+
+        // ===============================
+        // 5. 填充 map 下的目标位置和速度
+        // ===============================
+        target_msg.position.x = enemy_map.x();
+        target_msg.position.y = enemy_map.y();
+        target_msg.position.z = enemy_map.z();
+
+        target_msg.velocity.x = velocity_map.x();
+        target_msg.velocity.y = velocity_map.y();
+        target_msg.velocity.z = velocity_map.z();
+
+        // ===============================
+        // 6. 做一个简单预测
+        // ===============================
+        const double CHASSIS_RESPONSE_DELAY = 0.2;
+
+        double predicted_x =
+            enemy_map.x() + velocity_map.x() * CHASSIS_RESPONSE_DELAY;
+
+        double predicted_y =
+            enemy_map.y() + velocity_map.y() * CHASSIS_RESPONSE_DELAY;
+
+        double predicted_z =
+            enemy_map.z() + velocity_map.z() * CHASSIS_RESPONSE_DELAY;
+
+        // ===============================
+        // 7. 缓存目标，用于 TempLost 临时丢失时继续预测
+        // ===============================
+        last_known_target_.valid.store(true, std::memory_order_relaxed);
+        last_known_target_.last_update_time = now;
+
+        last_known_target_.position_x = enemy_map.x();
+        last_known_target_.position_y = enemy_map.y();
+        last_known_target_.position_z = enemy_map.z();
+
+        last_known_target_.velocity_x = velocity_map.x();
+        last_known_target_.velocity_y = velocity_map.y();
+        last_known_target_.velocity_z = velocity_map.z();
+
+        last_known_target_.predicted_x = predicted_x;
+        last_known_target_.predicted_y = predicted_y;
+        last_known_target_.predicted_z = predicted_z;
+
+        last_known_target_.confidence.store(1.0, std::memory_order_relaxed);
+    }
+
+    // ===============================
+    // 8. 如果是临时丢失，用上一次目标做预测
+    // ===============================
+    else if (
+        talos_data.state.status == talos::chrial::TrackerStatus::TempLost &&
+        last_known_target_.valid.load(std::memory_order_relaxed) &&
+        last_known_target_.confidence.load(std::memory_order_relaxed) > min_confidence_threshold_)
+    {
+        double time_since_last =
+            (now - last_known_target_.last_update_time).seconds();
+
+        target_msg.position.x =
+            last_known_target_.predicted_x +
+            last_known_target_.velocity_x * time_since_last;
+
+        target_msg.position.y =
+            last_known_target_.predicted_y +
+            last_known_target_.velocity_y * time_since_last;
+
+        target_msg.position.z =
+            last_known_target_.predicted_z +
+            last_known_target_.velocity_z * time_since_last;
+
         target_msg.velocity.x = last_known_target_.velocity_x;
         target_msg.velocity.y = last_known_target_.velocity_y;
         target_msg.velocity.z = last_known_target_.velocity_z;
-
-        double time_since_last = (now - last_known_target_.last_update_time).seconds();
-        target_msg.position.x += last_known_target_.velocity_x * time_since_last;
-        target_msg.position.y += last_known_target_.velocity_y * time_since_last;
-        target_msg.position.z = 0.0;
 
         target_msg.yaw = last_known_target_.yaw;
         target_msg.v_yaw = last_known_target_.v_yaw;
@@ -940,20 +1078,26 @@ void Node::publishTargetTracking(const talos::chrial::TalosData& talos_data)
         target_msg.dz = last_known_target_.dz;
         target_msg.armors_num = last_known_target_.armors_num;
         target_msg.id = last_known_target_.id;
+    }
 
-        RCLCPP_DEBUG(get_logger(), "Target TempLost: using predicted position (%.2f, %.2f) with confidence=%.2f",
-                    target_msg.position.x, target_msg.position.y,
-                    last_known_target_.confidence.load(std::memory_order_relaxed));
-    } else {
-        target_msg.position.x = 0;
-        target_msg.position.y = 0;
-        target_msg.position.z = 0;
-        target_msg.velocity.x = 0;
-        target_msg.velocity.y = 0;
-        target_msg.velocity.z = 0;
+    // ===============================
+    // 9. 没有有效目标
+    // ===============================
+    else {
+        target_msg.position.x = 0.0;
+        target_msg.position.y = 0.0;
+        target_msg.position.z = 0.0;
+
+        target_msg.velocity.x = 0.0;
+        target_msg.velocity.y = 0.0;
+        target_msg.velocity.z = 0.0;
+
         target_msg.confidence = 0.0;
     }
 
+    // ===============================
+    // 10. 补充机器人目标的装甲板信息
+    // ===============================
     if (talos_data.state_kind == talos::chrial::TargetStateKind::Robot) {
         target_msg.yaw = talos_data.state.robot.yaw;
         target_msg.v_yaw = talos_data.state.robot.v_yaw;
@@ -961,7 +1105,6 @@ void Node::publishTargetTracking(const talos::chrial::TalosData& talos_data)
         target_msg.radius_1 = talos_data.state.robot.radius0;
         target_msg.radius_2 = talos_data.state.robot.radius1;
         target_msg.dz = talos_data.state.robot.z1;
-
         target_msg.armors_num = talos_data.state.robot.armor_num;
 
         std::ostringstream oss;
@@ -994,6 +1137,7 @@ void Node::publishTargetTracking(const talos::chrial::TalosData& talos_data)
                 oss << "unknown";
                 break;
         }
+
         target_msg.id = oss.str();
 
         if (talos_data.state.status == talos::chrial::TrackerStatus::Tracking) {
@@ -1004,10 +1148,15 @@ void Node::publishTargetTracking(const talos::chrial::TalosData& talos_data)
             last_known_target_.dz = target_msg.dz;
             last_known_target_.armors_num = target_msg.armors_num;
             last_known_target_.id = target_msg.id;
-            last_known_target_.target_kind = talos::chrial::TargetStateKind::Robot;
+            last_known_target_.target_kind =
+                talos::chrial::TargetStateKind::Robot;
         }
+    }
 
-    } else if (talos_data.state_kind == talos::chrial::TargetStateKind::Outpost) {
+    // ===============================
+    // 11. 补充前哨站目标信息
+    // ===============================
+    else if (talos_data.state_kind == talos::chrial::TargetStateKind::Outpost) {
         target_msg.yaw = talos_data.state.outpost.yaw;
         target_msg.v_yaw = talos_data.state.outpost.v_yaw;
 
@@ -1017,18 +1166,21 @@ void Node::publishTargetTracking(const talos::chrial::TalosData& talos_data)
         if (talos_data.state.status == talos::chrial::TrackerStatus::Tracking) {
             last_known_target_.yaw = target_msg.yaw;
             last_known_target_.v_yaw = target_msg.v_yaw;
-            last_known_target_.radius_1 = 0;
-            last_known_target_.radius_2 = 0;
-            last_known_target_.dz = 0;
+            last_known_target_.radius_1 = 0.0;
+            last_known_target_.radius_2 = 0.0;
+            last_known_target_.dz = 0.0;
             last_known_target_.armors_num = target_msg.armors_num;
             last_known_target_.id = target_msg.id;
-            last_known_target_.target_kind = talos::chrial::TargetStateKind::Outpost;
+            last_known_target_.target_kind =
+                talos::chrial::TargetStateKind::Outpost;
         }
     }
 
+    // ===============================
+    // 12. 发布最终 map 坐标系下的目标
+    // ===============================
     target_tracking_pub_->publish(target_msg);
 }
-
 void Node::txLoop()
 {
     rclcpp::WallRate loop_rate { std::chrono::milliseconds(send_period_ms_) };
