@@ -531,7 +531,20 @@ void Node::parseFrames(std::vector<uint8_t>& rxbuf)
         if(hdr.id == rm_sentry_pp::ID_ROBOT_INFO){
             if(hdr.data_len == sizeof(rm_sentry_pp::ReceiveRobotInfoData::data) && frame_len == sizeof(rm_sentry_pp::ReceiveRobotInfoData)){
                 auto robot_info = rm_sentry_pp::fromBytes<rm_sentry_pp::ReceiveRobotInfoData>(rxbuf.data());
-                nav_status_ = robot_info.data.nav_status;
+                bool new_nav_status = robot_info.data.nav_status;
+                // 检测 nav_status_ 上升沿：归中刚完成，记录 IMU 参考值
+                if (!has_imu_centering_ref_ && new_nav_status && !nav_status_) {
+                    std::lock_guard<std::mutex> lk(tx_mtx_);
+                    imu_at_centering_ = latest_imu_raw_yaw_;
+                    {
+                        std::lock_guard<std::mutex> lk2(odom_mtx_);
+                        odom_at_centering_ = cached_odom_yaw_;
+                    }
+                    has_imu_centering_ref_ = true;
+                    RCLCPP_INFO(get_logger(), "Gimbal_big centering detected (nav_status rising edge): imu_at_centering=%.4f rad",
+                                imu_at_centering_);
+                }
+                nav_status_ = new_nav_status;
                 publishRobotInfo(robot_info);
             }
         }
@@ -613,19 +626,11 @@ void Node::publishImu(const rm_sentry_pp::ReceiveImuData& imu_data)
         //     is_calibrating_imu_ = false;
         // }
 
-        // gimbal_big 漂移校正：检测归中时刻，记录 IMU 参考值
-        if (!has_imu_centering_ref_ && std::abs(gimbal_big_yaw_) < IMU_CALIBRATION_THRESHOLD && nav_status_) {
-            imu_at_centering_ = imu_data.data.yaw;
-            double odom_yaw_copy;
-            {
-                std::lock_guard<std::mutex> lk(odom_mtx_);
-                odom_yaw_copy = cached_odom_yaw_;
-            }
-            odom_at_centering_ = odom_yaw_copy;
-            has_imu_centering_ref_ = true;
-            RCLCPP_INFO(get_logger(), "Gimbal_big centering detected: imu_at_centering=%.4f rad", imu_at_centering_);
-        }
     }
+
+    RCLCPP_INFO_THROTTLE(get_logger(), *this->get_clock(), 1000,
+        "gimbal_big_yaw=%.4f rad, nav_status_=%d, has_centering_ref=%d",
+        gimbal_big_yaw_, nav_status_, has_imu_centering_ref_);
 
     // double corrected_yaw = imu_data.data.yaw - imu_yaw_offset_;
     /*
@@ -1231,6 +1236,7 @@ void Node::txLoop()
                 pkt.time_stamp = nowMs();
                 pkt.data.posture = current_robot_posture_state_.data.posture;
                 pkt.data.follow_gimbal_big = follow_gimbal_big_;
+                pkt.data.track_status = track_status_;
                 pkt.eof = rm_sentry_pp::HeaderFrame::EoF();
             }
 

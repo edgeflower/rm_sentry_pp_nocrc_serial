@@ -108,7 +108,7 @@ private:
     double gimbal_lookahead_base_ { 0.8 };
     double gimbal_lookahead_k_ { 0.4 };
     double gimbal_yaw_smooth_alpha_ { 0.3 };
-    bool nav_status_;
+    bool nav_status_ = false;
 
     // Odometry parameters
     std::string odom_topic_;
@@ -178,8 +178,7 @@ private:
     double imu_yaw_offset_ = 0.0;
     bool is_calibrating_imu_ = false;
     rclcpp::Time last_imu_calibration_time_;
-    float imu_data_cached;  // imu 一上电位姿
-    static constexpr double IMU_CALIBRATION_THRESHOLD = 0.05;
+    static constexpr double IMU_CALIBRATION_THRESHOLD = 0.05;  // 保留，gimbal_yaw 校准用
     static constexpr double IMU_CALIBRATION_INTERVAL = 2.0;
 
     // Gimbal big drift correction (protected by tx_mtx_)
