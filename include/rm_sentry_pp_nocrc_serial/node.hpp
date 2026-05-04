@@ -121,6 +121,7 @@ private:
     rclcpp::Publisher<armor_interfaces::msg::Target>::SharedPtr target_tracking_pub_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr gimbal_yaw_marker_pub_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr lookahead_point_marker_pub_;
+    rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr enemy_marker_pub_;
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_chassis_sub_;
     rclcpp::Subscription<rm_decision_interfaces::msg::RobotControl>::SharedPtr robot_control_sub_;
     rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
@@ -159,6 +160,7 @@ private:
     bool follow_gimbal_big_ = false;
     float gimbal_yaw_ = 0.0f;
     bool track_status_ = false;
+    double gimbal_big_yaw_angle_state_;
 
 
     // Gimbal path follow - high frequency resampling
@@ -207,20 +209,7 @@ private:
     // chiral
     std::unique_ptr<talos::chiral::ipc::TalosDataReader> chiral_reader_;
 
-    // Target lost prediction
-    struct LastKnownTarget {
-        std::atomic<bool> valid{false};
-        rclcpp::Time last_update_time;
-        double position_x = 0, position_y = 0, position_z = 0;
-        double velocity_x = 0, velocity_y = 0, velocity_z = 0;
-        double yaw = 0, v_yaw = 0;
-        double radius_1 = 0, radius_2 = 0, dz = 0;
-        int32_t armors_num = 0;
-        std::string id;
-        talos::chrial::TargetStateKind target_kind = talos::chrial::TargetStateKind::Robot;
-        std::atomic<double> confidence{1.0};
-        double predicted_x = 0, predicted_y = 0, predicted_z = 0;
-    } last_known_target_;
+
 
     // Odometry cache
     std::mutex odom_mtx_;

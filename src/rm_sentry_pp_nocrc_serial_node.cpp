@@ -1,3 +1,4 @@
+#include "chiral/chrial.hpp"
 #include "rm_sentry_pp_nocrc_serial/node.hpp"
 #include "rm_sentry_pp_nocrc_serial/packet.hpp"
 #include <rclcpp/logging.hpp>
@@ -58,6 +59,7 @@ Node::Node(const rclcpp::NodeOptions& options)
     target_tracking_pub_ = create_publisher<armor_interfaces::msg::Target>("target_tracking", 10);
     gimbal_yaw_marker_pub_ = create_publisher<visualization_msgs::msg::Marker>("expected_gimbal_yaw", 10);
     lookahead_point_marker_pub_ = create_publisher<visualization_msgs::msg::Marker>("lookahead_point_marker", 10);
+    enemy_marker_pub_ = create_publisher<visualization_msgs::msg::Marker>("enemy_marker", 10);
 
     cmd_vel_chassis_sub_ = create_subscription<geometry_msgs::msg::Twist>(
         cmd_vel_chassis_topic_, 10,
@@ -117,7 +119,6 @@ Node::Node(const rclcpp::NodeOptions& options)
 
     node_start_ = this->now();
     last_imu_calibration_time_ = node_start_;
-    last_known_target_.last_update_time = node_start_;
     last_gimbal_angle_update_ = node_start_;
     last_path_time_ = node_start_;
     last_drift_update_ = node_start_;
@@ -599,6 +600,17 @@ void Node::publishImu(const rm_sentry_pp::ReceiveImuData& imu_data)
     gimbal_big_yaw_ = deg_to_rad_pi(-imu_data.data.chassis_yaw); // 获取gimbal_big 的机械角 因为 chassis_yaw 是 gimbal_big 坐标系下的，所以 加个负号就可以了
     gimbal_yaw_ = deg_to_rad_pi(imu_data.data.gimbal_yaw); // 获取 gimbal_yaw 的机械角
 
+    // 发布 gimbal_yaw TF: gimbal_big -> gimbal_yaw
+    {
+        geometry_msgs::msg::TransformStamped tf_gimbal_yaw;
+        tf_gimbal_yaw.header.stamp = now;
+        tf_gimbal_yaw.header.frame_id = "gimbal_big"; // "gimbal_big"
+        tf_gimbal_yaw.child_frame_id = "gimbal_yaw";
+        tf2::Quaternion q_gimbal_yaw;
+        q_gimbal_yaw.setRPY(0, 0, gimbal_yaw_);
+        tf_gimbal_yaw.transform.rotation = tf2::toMsg(q_gimbal_yaw);
+        tf_broadcaster_->sendTransform(tf_gimbal_yaw);
+    }
 
     {
         std::lock_guard<std::mutex> lk(tx_mtx_);
@@ -629,8 +641,8 @@ void Node::publishImu(const rm_sentry_pp::ReceiveImuData& imu_data)
     }
 
     RCLCPP_INFO_THROTTLE(get_logger(), *this->get_clock(), 1000,
-        "gimbal_big_yaw=%.4f rad, nav_status_=%d, has_centering_ref=%d",
-        gimbal_big_yaw_, nav_status_, has_imu_centering_ref_);
+        "gimbal_big_yaw=%.4f gimbal_yaw=%.4f rad, nav_status_=%d, has_centering_ref=%d",
+        gimbal_big_yaw_, gimbal_yaw_, nav_status_, has_imu_centering_ref_);
 
     // double corrected_yaw = imu_data.data.yaw - imu_yaw_offset_;
     /*
@@ -814,7 +826,7 @@ void Node::publishTargetTracking(const talos::chrial::TalosData& talos_data)
 
     armor_interfaces::msg::Target target_msg;
     target_msg.header.stamp = now;
-    target_msg.header.frame_id = "map";
+    target_msg.header.frame_id = "gimbal_yaw";
 
     // ===============================
     // 1. 先处理追踪状态
@@ -825,29 +837,12 @@ void Node::publishTargetTracking(const talos::chrial::TalosData& talos_data)
             target_msg.tracking_status = 0;
             target_msg.confidence = 0.0;
 
-            last_known_target_.valid.store(false, std::memory_order_relaxed);
-            last_known_target_.confidence.store(0.0, std::memory_order_relaxed);
             break;
 
         case talos::chrial::TrackerStatus::Detecting:
             target_msg.tracking = false;
             target_msg.tracking_status = 1;
-
-            if (last_known_target_.valid.load(std::memory_order_relaxed)) {
-                double time_since_last =
-                    (now - last_known_target_.last_update_time).seconds();
-
-                double decayed_confidence = calculateDecayedConfidence(
-                    last_known_target_.confidence.load(std::memory_order_relaxed),
-                    time_since_last);
-
-                last_known_target_.confidence.store(
-                    decayed_confidence,
-                    std::memory_order_relaxed);
-            }
-
-            target_msg.confidence =
-                last_known_target_.confidence.load(std::memory_order_relaxed);
+            target_msg.confidence = 0.0;
             break;
 
         case talos::chrial::TrackerStatus::Tracking:
@@ -857,32 +852,17 @@ void Node::publishTargetTracking(const talos::chrial::TalosData& talos_data)
             break;
 
         case talos::chrial::TrackerStatus::TempLost:
-            target_msg.tracking = false;
+            target_msg.tracking = true;
             target_msg.tracking_status = 3;
+            target_msg.confidence = 1.0;
 
-            if (last_known_target_.valid.load(std::memory_order_relaxed)) {
-                double time_since_last =
-                    (now - last_known_target_.last_update_time).seconds();
-
-                double decayed_confidence = calculateDecayedConfidence(
-                    last_known_target_.confidence.load(std::memory_order_relaxed),
-                    time_since_last);
-
-                last_known_target_.confidence.store(
-                    decayed_confidence,
-                    std::memory_order_relaxed);
-
-                target_msg.confidence = decayed_confidence;
-            } else {
-                target_msg.confidence = 0.0;
-            }
             break;
     }
 
     // ===============================
     // 2. 如果当前正在追踪目标，使用视觉实时数据
     // ===============================
-    if (talos_data.state.status == talos::chrial::TrackerStatus::Tracking) {
+    if (talos_data.state.status == talos::chrial::TrackerStatus::Tracking || talos_data.state.status == talos::chrial::TrackerStatus::TempLost) {
         double enemy_x = 0.0;
         double enemy_y = 0.0;
         double enemy_z = 0.0;
@@ -923,166 +903,14 @@ void Node::publishTargetTracking(const talos::chrial::TalosData& talos_data)
             return;
         }
 
-        // 敌人在 gimbal_yaw 坐标系下的位置向量
-        tf2::Vector3 enemy_gimbal_yaw(enemy_x, enemy_y, enemy_z);
+        // 直接使用 gimbal_yaw 坐标系下的位置和速度（视觉数据已在 gimbal_yaw 系下）
+        target_msg.position.x = enemy_x;
+        target_msg.position.y = enemy_y;
+        target_msg.position.z = enemy_z;
 
-        // 敌人在 gimbal_yaw 坐标系下的速度向量
-        tf2::Vector3 velocity_gimbal_yaw(enemy_vx, enemy_vy, enemy_vz);
-
-        // ===============================
-        // 3. 获取 gimbal_yaw 相对于 gimbal_big 的机械角
-        // ===============================
-        double gimbal_yaw_now = 0.0;
-        {
-            std::lock_guard<std::mutex> lk(tx_mtx_);
-
-            // gimbal_yaw_ 是下位机给的机械角
-            // 机器人归中时为 0°
-            // 这里已经在 publishImu() 中转成了弧度
-            gimbal_yaw_now = gimbal_yaw_;
-        }
-
-        // -------------------------------
-        // 这里定义的是：
-        //
-        // gimbal_big -> gimbal_yaw
-        //
-        // 也就是说：
-        // 在 gimbal_big 看来，gimbal_yaw 转了 gimbal_yaw_now
-        // -------------------------------
-        tf2::Quaternion q_big_to_yaw;
-        q_big_to_yaw.setRPY(0.0, 0.0, gimbal_yaw_now);
-
-        // -------------------------------
-        // 但是现在 enemy_gimbal_yaw 是在 gimbal_yaw 坐标系下的点
-        //
-        // 我们要把它变成 gimbal_big 坐标系下的点：
-        //
-        // gimbal_yaw -> gimbal_big
-        //
-        // 所以要用 inverse()
-        // -------------------------------
-        tf2::Vector3 enemy_gimbal_big =
-            tf2::quatRotate(q_big_to_yaw.inverse(), enemy_gimbal_yaw);
-
-        tf2::Vector3 velocity_gimbal_big =
-            tf2::quatRotate(q_big_to_yaw.inverse(), velocity_gimbal_yaw);
-
-        // ===============================
-        // 4. 获取 gimbal_big / chassis 在 map 下的位置和角度
-        // ===============================
-        double chassis_x = 0.0;
-        double chassis_y = 0.0;
-        double chassis_yaw = 0.0;
-
-        if (!getChassisPoseInMap(chassis_x, chassis_y, chassis_yaw)) {
-            target_tracking_pub_->publish(target_msg);
-            return;
-        }
-
-        // -------------------------------
-        // 你的系统里：
-        //
-        // gimbal_big ≈ chassis
-        //
-        // 所以 chassis_yaw 就是 gimbal_big 在 map 下的 yaw
-        // -------------------------------
-        tf2::Quaternion q_map_to_big;
-        q_map_to_big.setRPY(0.0, 0.0, chassis_yaw);
-
-        tf2::Vector3 t_map_to_big(chassis_x, chassis_y, 0.0);
-
-        // -------------------------------
-        // 把敌人从 gimbal_big 坐标系转到 map 坐标系
-        //
-        // enemy_map = R(map <- gimbal_big) * enemy_gimbal_big + 平移
-        // -------------------------------
-        tf2::Vector3 enemy_map =
-            tf2::quatRotate(q_map_to_big, enemy_gimbal_big) + t_map_to_big;
-
-        tf2::Vector3 velocity_map =
-            tf2::quatRotate(q_map_to_big, velocity_gimbal_big);
-
-        // ===============================
-        // 5. 填充 map 下的目标位置和速度
-        // ===============================
-        target_msg.position.x = enemy_map.x();
-        target_msg.position.y = enemy_map.y();
-        target_msg.position.z = enemy_map.z();
-
-        target_msg.velocity.x = velocity_map.x();
-        target_msg.velocity.y = velocity_map.y();
-        target_msg.velocity.z = velocity_map.z();
-
-        // ===============================
-        // 6. 做一个简单预测
-        // ===============================
-        const double CHASSIS_RESPONSE_DELAY = 0.2;
-
-        double predicted_x =
-            enemy_map.x() + velocity_map.x() * CHASSIS_RESPONSE_DELAY;
-
-        double predicted_y =
-            enemy_map.y() + velocity_map.y() * CHASSIS_RESPONSE_DELAY;
-
-        double predicted_z =
-            enemy_map.z() + velocity_map.z() * CHASSIS_RESPONSE_DELAY;
-
-        // ===============================
-        // 7. 缓存目标，用于 TempLost 临时丢失时继续预测
-        // ===============================
-        last_known_target_.valid.store(true, std::memory_order_relaxed);
-        last_known_target_.last_update_time = now;
-
-        last_known_target_.position_x = enemy_map.x();
-        last_known_target_.position_y = enemy_map.y();
-        last_known_target_.position_z = enemy_map.z();
-
-        last_known_target_.velocity_x = velocity_map.x();
-        last_known_target_.velocity_y = velocity_map.y();
-        last_known_target_.velocity_z = velocity_map.z();
-
-        last_known_target_.predicted_x = predicted_x;
-        last_known_target_.predicted_y = predicted_y;
-        last_known_target_.predicted_z = predicted_z;
-
-        last_known_target_.confidence.store(1.0, std::memory_order_relaxed);
-    }
-
-    // ===============================
-    // 8. 如果是临时丢失，用上一次目标做预测
-    // ===============================
-    else if (
-        talos_data.state.status == talos::chrial::TrackerStatus::TempLost &&
-        last_known_target_.valid.load(std::memory_order_relaxed) &&
-        last_known_target_.confidence.load(std::memory_order_relaxed) > min_confidence_threshold_)
-    {
-        double time_since_last =
-            (now - last_known_target_.last_update_time).seconds();
-
-        target_msg.position.x =
-            last_known_target_.predicted_x +
-            last_known_target_.velocity_x * time_since_last;
-
-        target_msg.position.y =
-            last_known_target_.predicted_y +
-            last_known_target_.velocity_y * time_since_last;
-
-        target_msg.position.z =
-            last_known_target_.predicted_z +
-            last_known_target_.velocity_z * time_since_last;
-
-        target_msg.velocity.x = last_known_target_.velocity_x;
-        target_msg.velocity.y = last_known_target_.velocity_y;
-        target_msg.velocity.z = last_known_target_.velocity_z;
-
-        target_msg.yaw = last_known_target_.yaw;
-        target_msg.v_yaw = last_known_target_.v_yaw;
-        target_msg.radius_1 = last_known_target_.radius_1;
-        target_msg.radius_2 = last_known_target_.radius_2;
-        target_msg.dz = last_known_target_.dz;
-        target_msg.armors_num = last_known_target_.armors_num;
-        target_msg.id = last_known_target_.id;
+        target_msg.velocity.x = enemy_vx;
+        target_msg.velocity.y = enemy_vy;
+        target_msg.velocity.z = enemy_vz;
     }
 
     // ===============================
@@ -1096,8 +924,6 @@ void Node::publishTargetTracking(const talos::chrial::TalosData& talos_data)
         target_msg.velocity.x = 0.0;
         target_msg.velocity.y = 0.0;
         target_msg.velocity.z = 0.0;
-
-        target_msg.confidence = 0.0;
     }
 
     // ===============================
@@ -1144,18 +970,6 @@ void Node::publishTargetTracking(const talos::chrial::TalosData& talos_data)
         }
 
         target_msg.id = oss.str();
-
-        if (talos_data.state.status == talos::chrial::TrackerStatus::Tracking) {
-            last_known_target_.yaw = target_msg.yaw;
-            last_known_target_.v_yaw = target_msg.v_yaw;
-            last_known_target_.radius_1 = target_msg.radius_1;
-            last_known_target_.radius_2 = target_msg.radius_2;
-            last_known_target_.dz = target_msg.dz;
-            last_known_target_.armors_num = target_msg.armors_num;
-            last_known_target_.id = target_msg.id;
-            last_known_target_.target_kind =
-                talos::chrial::TargetStateKind::Robot;
-        }
     }
 
     // ===============================
@@ -1167,22 +981,44 @@ void Node::publishTargetTracking(const talos::chrial::TalosData& talos_data)
 
         target_msg.id = "outpost";
         target_msg.armors_num = 3;
-
-        if (talos_data.state.status == talos::chrial::TrackerStatus::Tracking) {
-            last_known_target_.yaw = target_msg.yaw;
-            last_known_target_.v_yaw = target_msg.v_yaw;
-            last_known_target_.radius_1 = 0.0;
-            last_known_target_.radius_2 = 0.0;
-            last_known_target_.dz = 0.0;
-            last_known_target_.armors_num = target_msg.armors_num;
-            last_known_target_.id = target_msg.id;
-            last_known_target_.target_kind =
-                talos::chrial::TargetStateKind::Outpost;
-        }
     }
 
     // ===============================
-    // 12. 发布最终 map 坐标系下的目标
+    // 12. 发布敌人位置 marker (黄色球, 0.5m半径)
+    // ===============================
+    if (target_msg.tracking || target_msg.tracking_status == 2 || target_msg.tracking_status == 3) {
+        visualization_msgs::msg::Marker enemy_marker;
+        enemy_marker.header.stamp = now;
+        enemy_marker.header.frame_id = "gimbal_yaw";
+        enemy_marker.ns = "enemy";
+        enemy_marker.id = 0;
+        enemy_marker.type = visualization_msgs::msg::Marker::SPHERE;
+        enemy_marker.action = visualization_msgs::msg::Marker::ADD;
+        enemy_marker.pose.position.x = target_msg.position.x;
+        enemy_marker.pose.position.y = target_msg.position.y;
+        enemy_marker.pose.position.z = target_msg.position.z;
+        enemy_marker.pose.orientation.w = 1.0;
+        enemy_marker.scale.x = 1.0;
+        enemy_marker.scale.y = 1.0;
+        enemy_marker.scale.z = 1.0;
+        enemy_marker.color.r = 1.0f;
+        enemy_marker.color.g = 1.0f;
+        enemy_marker.color.b = 0.0f;
+        enemy_marker.color.a = 0.8f;
+        enemy_marker.lifetime = rclcpp::Duration::from_seconds(0.5);
+        enemy_marker_pub_->publish(enemy_marker);
+    } else {
+        visualization_msgs::msg::Marker enemy_marker;
+        enemy_marker.header.stamp = now;
+        enemy_marker.header.frame_id = "gimbal_yaw";
+        enemy_marker.ns = "enemy";
+        enemy_marker.id = 0;
+        enemy_marker.action = visualization_msgs::msg::Marker::DELETE;
+        enemy_marker_pub_->publish(enemy_marker);
+    }
+
+    // ===============================
+    // 13. 发布 gimbal_yaw 坐标系下的目标
     // ===============================
     target_tracking_pub_->publish(target_msg);
 }
@@ -1210,7 +1046,15 @@ void Node::txLoop()
                 if (angle_valid) {
                     double dt_since = (this->now() - last_drift_update_).seconds();
                     double predicted_drift = gimbal_big_drift_ + gimbal_big_drift_rate_ * dt_since;
-                    pkt.data.gimbal_big.yaw_angle = gimbal_big_yaw_angle_ + predicted_drift;
+                    gimbal_big_yaw_angle_state_ = gimbal_big_yaw_angle_ + predicted_drift;
+                    pkt.data.gimbal_big.yaw_angle = gimbal_big_yaw_angle_state_;
+                        RCLCPP_INFO_THROTTLE(
+                        this->get_logger(),
+                        *this->get_clock(),
+                        1000,   // ms
+                        "发布角度%f",
+                        pkt.data.gimbal_big.yaw_angle
+                    );
                     pkt.data.gimbal_big.yaw_vel = 0.0f;
                 } else {
                     pkt.data.gimbal_big.yaw_angle = 0.0f;
