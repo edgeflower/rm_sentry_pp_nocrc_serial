@@ -28,6 +28,7 @@
 #include <vector>
 #include <cmath>
 
+#include "chiral/chiral_endpoint.hpp"
 #include "rm_sentry_pp_nocrc_serial/packet.hpp"
 #include "rm_sentry_pp_nocrc_serial/serial_port.hpp"
 #include "chiral/talos_triple_buffer_shm.hpp"
@@ -161,6 +162,7 @@ private:
     float gimbal_yaw_ = 0.0f;
     bool track_status_ = false;
     double gimbal_big_yaw_angle_state_;
+    bool perception_status_ = true;
 
 
     // Gimbal path follow - high frequency resampling
@@ -199,7 +201,6 @@ private:
     static constexpr double DRIFT_FILTER_ALPHA = 0.15;
 
     bool tx_pending_ { false };
-    bool tx_posture_pending_ { false };
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 
     // tf2
@@ -207,7 +208,7 @@ private:
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
     // chiral
-    std::unique_ptr<talos::chiral::ipc::TalosDataReader> chiral_reader_;
+    std::unique_ptr<talos::chiral::ipc::RemoteSide> chiral_reader_;
 
 
 
@@ -227,6 +228,12 @@ private:
     double cached_map_to_odom_yaw_ { 0.0 };
     bool has_cached_map_to_odom_ { false };
     rclcpp::TimerBase::SharedPtr map_odom_timer_;
+
+    // Posture confirmation (service blocks until lower-level reports match)
+    std::atomic<uint8_t> pending_confirm_posture_ {0};
+    std::atomic<bool> posture_confirmed_ {false};
+    int posture_confirm_timeout_ms_ {500};
+    int current_posture_ {0};
 
     // Confidence decay parameters
     double confidence_decay_lambda_ = 0.5;

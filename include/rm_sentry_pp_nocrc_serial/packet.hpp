@@ -47,7 +47,7 @@ struct ReceiveRobotInfoData
         uint16_t heat;  // 机器人枪管热量
         uint16_t heat_limit; // 机器人热量限制
         uint16_t shot_allowance; // 17mm弹丸剩余量
-        uint16_t posture; // 机器人实际姿态 1=进攻, 2=防御, 3=移动 (下位机控制)
+        uint8_t posture; // 机器人实际姿态 1=进攻, 2=防御, 3=移动 (下位机控制)
         bool nav_status; // 机器人初始化状态 false 未初始化， true 已初始化
     } data;  // 裁判系统信息
 
@@ -245,12 +245,6 @@ struct ReceiveImuData {
         float gimbal_yaw; // 小云台 gimbal_yaw 的机械角 与上电时偏移角度（正中心） 单位 ° ，而不是 gimbal_big 的机械角，gimbal_big 只有 imu 的角度
         float chassis_yaw; // 底盘位姿 下位机计算出来的 范围 -π ~ π // 这玩意 用不上，先不用
         float yaw; // rad  这是 gimbal_big 的 imu 角度 ，而 gimbal_yaw的imu 角度 在 视觉给的 imu 信息里
-        float pitch; // rad
-        float roll; // rad
-
-        float yaw_vel; // rad/s
-        float pitch_vel; // rad/s
-        float roll_vel; // rad/s
     } data;
 
     uint8_t eof; // 0xA5
@@ -286,6 +280,7 @@ struct SendRobotPostureData   // 机器人姿态 0x0120
         uint8_t posture; // 机器人姿态    1 进攻 、2 防御 、 3 移动
         bool follow_gimbal_big; // 是否跟随大云台 0 不跟随 1 跟随  //底盘跟随
         bool track_status;      // 是否启动履带 0 不启动 1 启动
+        bool perception_status;  // 大云台是否跟随全向感知 0 不跟随
     } data;
 
     uint8_t eof; // 0xA5
@@ -295,15 +290,15 @@ struct SendRobotPostureData   // 机器人姿态 0x0120
 #pragma pack(pop)
 
 static_assert(sizeof(HeaderFrame) == 3);
-static_assert(sizeof(ReceiveRobotInfoData) == 22);    // 3 + 4 + 15 + 1
+static_assert(sizeof(ReceiveRobotInfoData) == 21);    // 3 + 4 + 15 + 1
 static_assert(sizeof(ReceiveGameStatusData) == 11);   // 3 + 4 + 3 + 1
 static_assert(sizeof(ReceiveAllRobotHpData) == 40);   // 3 + 4 + 33 + 1
 static_assert(sizeof(ReceiveRobotLocation) == 48);    // 3 + 4 + 40 + 1
-static_assert(sizeof(ReceiveImuData) == 41);          // 3 + 4 + 28 + 1
+static_assert(sizeof(ReceiveImuData) == 21);          // 3 + 4 + 13 + 1
 static_assert(sizeof(SendRobotCmdData) == 28);        // 3 + 4 + 16 + 1
-static_assert(sizeof(SendRobotPostureData) == 11);    // 3 + 4 + 3 + 1
-static_assert(sizeof(ReceiveRfid) == 13 );            // 3 + 4 + 38 + 1
-static_assert(sizeof(ReceiveRFID) == 46 );            // 3 + 4 + 5 + 1
+static_assert(sizeof(SendRobotPostureData) == 12);    // 3 + 4 + 3 + 1
+static_assert(sizeof(ReceiveRfid) == 13 );            // 3 + 4 + 5 + 1
+static_assert(sizeof(ReceiveRFID) == 46 );            // 3 + 4 + 38 + 1
 static_assert(sizeof(ReceiveEnemyLocation) == 48);    // 3 + 4 + 5 + 1
 
 template <typename T>

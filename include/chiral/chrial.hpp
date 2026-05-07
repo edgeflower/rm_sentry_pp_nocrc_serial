@@ -16,7 +16,8 @@ using RadianPerSec = double;
 using Meter        = double;
 
 struct odom {};
-struct gimbal {};
+struct gimbal_yaw {};
+struct gimbal_pitch {};
 struct camera {};
 struct muzzle {};
 struct untyped {};
@@ -50,10 +51,10 @@ struct Transform {
 enum TargetStateKind : uint8_t { Robot = 0, Outpost = 1 };
 
 enum class TrackerStatus : uint8_t {
-    Idle      = 0,  // 挂机	大云台转
-    Detecting = 1,  // 正在识别      大云台转
-    Tracking  = 2, // 锁定	不转
-    TempLost  = 3,  // 不转
+    Idle      = 0,
+    Detecting = 1,
+    Tracking  = 2,
+    TempLost  = 3,
 };
 
 enum class ArmorColor : uint8_t {
@@ -61,7 +62,7 @@ enum class ArmorColor : uint8_t {
     Red     = 1,
     Neutral = 2,
     Purple  = 3,
-};  // 先不管
+};
 
 enum class ArmorName : uint8_t {
     Sentry = 0,
@@ -77,18 +78,18 @@ enum class ArmorName : uint8_t {
 };
 
 struct OutpostState {
-    Vector3d<odom> position;   // 相对于 小云台odom  yaw 电机             (前哨站相对位置）
-    Vector3d<odom> velocity;   //  p + v*t  相对于小云台 odom yaw电机     （前哨站 装甲板）
-    Radian yaw;			//  前哨站的 yaw
-    RadianPerSec v_yaw;		//  前哨站的  vel
+    Vector3d<gimbal_yaw> position;
+    Vector3d<gimbal_yaw> velocity;
+    Radian yaw;
+    RadianPerSec v_yaw;
     // odom z0, z1, z2
-    std::array<double, 3> z{0, 0, 0};   
+    std::array<double, 3> z{0, 0, 0};
 };
 
 struct RobotState {
-    Vector3d<odom> position;  // 相对位置     ************
-    Vector3d<odom> velocity;
-    Radian yaw;		//  yaw 绝对
+    Vector3d<gimbal_yaw> position;
+    Vector3d<gimbal_yaw> velocity;
+    Radian yaw;
     RadianPerSec v_yaw;
     Meter radius0; // Armor 0,2 radius
     Meter radius1; // Armor 1,3 radius
@@ -105,12 +106,18 @@ struct TargetState {
 };
 
 struct TalosData {
-    TargetStateKind state_kind;  // 识别状态
+    TargetStateKind state_kind;
     TargetState state;
 
-    Transform<odom, gimbal> gimbal_link;  // imu   ************* // gimbal_yaw 的 imu 角度，当然，只用 yaw 不用别的
-    Transform<gimbal, muzzle> muzzle_link;  //枪管
-    Transform<gimbal, camera> camera_link;
+    Transform<odom, gimbal_yaw> gimbal_link;
+    Transform<gimbal_yaw, muzzle> muzzle_link;
+    Transform<gimbal_yaw, camera> camera_link;
+};
+
+// ============ Incoming data (External → Talos) ============
+
+struct IncomingData {
+    uint64_t timestamp_ns = 0;
 };
 
 } // namespace talos::chrial

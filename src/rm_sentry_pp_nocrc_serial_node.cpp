@@ -1,3 +1,4 @@
+#include "chiral/chiral_endpoint.hpp"
 #include "chiral/chrial.hpp"
 #include "rm_sentry_pp_nocrc_serial/node.hpp"
 #include "rm_sentry_pp_nocrc_serial/packet.hpp"
@@ -31,6 +32,7 @@ Node::Node(const rclcpp::NodeOptions& options)
 
     // Gimbal angle timeout for tracking
     gimbal_angle_timeout_ms_ = declare_parameter<int>("gimbal_angle_timeout_ms", 300);
+    posture_confirm_timeout_ms_ = declare_parameter<int>("posture_confirm_timeout_ms", 500);
     gimbal_follow_path_topic_ = declare_parameter<std::string>("gimbal_follow_path_topic", "plan");
     gimbal_follow_lookahead_ = declare_parameter<double>("gimbal_follow_lookahead", 1.5);
     gimbal_lookahead_base_ = declare_parameter<double>("gimbal_lookahead_base", 0.8);
@@ -125,9 +127,9 @@ Node::Node(const rclcpp::NodeOptions& options)
     last_odom_time_ = node_start_;
 
     // 初始化 Chiral 读取器
-    auto chiral_reader = talos::chiral::ipc::TalosDataReader::open();
+    auto chiral_reader = talos::chiral::ipc::RemoteSide::create();
     if (chiral_reader) {
-        chiral_reader_ = std::make_unique<talos::chiral::ipc::TalosDataReader>(std::move(*chiral_reader));
+        chiral_reader_ = std::make_unique<talos::chiral::ipc::RemoteSide>(std::move(*chiral_reader));
         RCLCPP_INFO(get_logger(), "Chiral reader initialized successfully");
     } else {
         RCLCPP_WARN(get_logger(), "Failed to initialize chiral reader: %d", static_cast<int>(chiral_reader.error()));
@@ -191,6 +193,7 @@ void Node::onRobotControl(const rm_decision_interfaces::msg::RobotControl& msg)
     target_spin_vel_ = msg.chassis_spin_vel;
     follow_gimbal_big_ = msg.follow_gimbal_big;
     track_status_ = msg.track_status;
+    perception_status_ = msg.perception_status;
     tx_pending_ = true;
 }
 
@@ -426,15 +429,51 @@ void Node::handleSetSentryPosture(
     const std::shared_ptr<rm_decision_interfaces::srv::SetSentryPosture::Request> request,
     std::shared_ptr<rm_decision_interfaces::srv::SetSentryPosture::Response> response)
 {
-    std::lock_guard<std::mutex> lk(tx_mtx_);
-    current_robot_posture_state_.data.posture = request->posture;
-    tx_posture_pending_ = true;
+    // 合法姿态值: 1=进攻, 2=防御, 3=移动
+    if (request->posture < 1 || request->posture > 3) {
+        response->accepted = false;
+        response->message = "Invalid posture value: " + std::to_string(request->posture) + " (must be 1, 2, or 3)";
+        RCLCPP_WARN(get_logger(), "Rejected invalid posture: %u", request->posture);
+        return;
+    }
 
-    response->accepted = true;
-    response->message = "Posture set to " + std::to_string(request->posture);
+    {
+        std::lock_guard<std::mutex> lk(tx_mtx_);
+        current_robot_posture_state_.data.posture = request->posture;
+    }
 
     RCLCPP_INFO(get_logger(), "SentryPosture service called: posture=%u override=%d",
                 request->posture, request->override_mode);
+
+    // override 模式：不等待确认直接返回
+    if (request->override_mode) {
+        response->accepted = true;
+        response->message = "Posture set (override, no confirm): " + std::to_string(request->posture);
+        return;
+    }
+
+    // 阻塞等待下位机上报的姿态与目标一致
+    posture_confirmed_.store(false, std::memory_order_release);
+    pending_confirm_posture_.store(request->posture, std::memory_order_release);
+
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(posture_confirm_timeout_ms_);
+
+    while (!posture_confirmed_.load(std::memory_order_acquire)) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            response->accepted = false;
+            response->message = "Posture confirm timeout for " + std::to_string(request->posture);
+            pending_confirm_posture_.store(0, std::memory_order_release);
+            RCLCPP_WARN(get_logger(), "Posture confirm timeout: target=%u  ,sent posture= %u , current posture = %u", request->posture ,current_robot_posture_state_.data.posture , current_posture_);
+            return;
+        }
+        std::this_thread::sleep_for(10ms);
+    }
+
+    pending_confirm_posture_.store(0, std::memory_order_release);
+    response->accepted = true;
+    response->message = "Posture confirmed: " + std::to_string(request->posture);
+    RCLCPP_INFO(get_logger(), "Posture confirmed: %u", request->posture);
 }
 
 void Node::protectLoop()
@@ -665,6 +704,13 @@ void Node::publishRobotInfo(const rm_sentry_pp::ReceiveRobotInfoData& robot_info
     posture_msg.current_posture = robot_info_data.data.posture;
 
     posture_pub_->publish(posture_msg);
+
+    // 姿态确认：下位机上报姿态与等待中的目标一致时，触发 service 返回
+    current_posture_ = posture_msg.current_posture;
+    uint8_t pending = pending_confirm_posture_.load(std::memory_order_acquire);
+    if (pending != 0 && robot_info_data.data.posture == pending) {
+        posture_confirmed_.store(true, std::memory_order_release);
+    }
 
     rm_decision_interfaces::msg::RobotStatus robot_status_msg;
     robot_status_msg.robot_id = robot_info_data.data.id;
@@ -1081,6 +1127,7 @@ void Node::txLoop()
                 pkt.data.posture = current_robot_posture_state_.data.posture;
                 pkt.data.follow_gimbal_big = follow_gimbal_big_;
                 pkt.data.track_status = track_status_;
+                pkt.data.perception_status = perception_status_;
                 pkt.eof = rm_sentry_pp::HeaderFrame::EoF();
             }
 
