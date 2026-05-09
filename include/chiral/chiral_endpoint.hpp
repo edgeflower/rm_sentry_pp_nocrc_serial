@@ -1,12 +1,12 @@
 #pragma once
 
-#include "chrial.hpp"
 #include "shm_layout.hpp"
 #include "shm_triple_buffer.hpp"
 #include <atomic>
 #include <cstring>
 #include <expected>
 #include <fcntl.h>
+#include <memory>
 #include <optional>
 #include <string>
 #include <sys/mman.h>
@@ -36,16 +36,6 @@ inline constexpr uint32_t TALOS_SHM_VERSION = 2;          // v2: triple buffer
 
 template <typename T>
 struct ShmName;
-
-template <>
-struct ShmName<chrial::TalosData> {
-    static constexpr const char* value = "/chiral_talos_out";
-};
-
-template <>
-struct ShmName<chrial::IncomingData> {
-    static constexpr const char* value = "/chiral_talos_in";
-};
 
 // ============ SHM 布局 ============
 
@@ -415,13 +405,14 @@ public:
      * 创建 outgoing SHM (此端为 producer)。incoming SHM 由 read_new()
      * / read_latest() 按需打开，并在对端重启后自动重连。
      */
-    [[nodiscard]] static std::expected<ChiralEndpoint, ShmError> create() noexcept {
+    [[nodiscard]] static std::expected<std::unique_ptr<ChiralEndpoint>, ShmError>
+        create() noexcept {
         auto writer = ChannelWriter<Outgoing>::create();
         if (!writer) {
             return std::unexpected(writer.error());
         }
 
-        return ChiralEndpoint(std::move(*writer));
+        return std::make_unique<ChiralEndpoint>(std::move(*writer));
     }
 
     void write(const Outgoing& data) noexcept { writer_.write(data); }
@@ -453,6 +444,10 @@ public:
         return reader->read_latest();
     }
 
+    explicit ChiralEndpoint(ChannelWriter<Outgoing>&& writer) noexcept
+        : writer_(std::move(writer))
+        , reader_(std::nullopt) {}
+
 private:
     [[nodiscard]] ChannelReader<Incoming>* lazy_reader() const noexcept {
         if (reader_ && !reader_->is_current_mapping()) {
@@ -471,22 +466,8 @@ private:
         return &*reader_;
     }
 
-    explicit ChiralEndpoint(ChannelWriter<Outgoing>&& writer) noexcept
-        : writer_(std::move(writer))
-        , reader_(std::nullopt) {}
-
     ChannelWriter<Outgoing> writer_;
     mutable std::optional<ChannelReader<Incoming>> reader_;
 };
-
-// ============ 强类型别名 ============
-
-using TalosSide  = ChiralEndpoint<chrial::TalosData, chrial::IncomingData>;
-using RemoteSide = ChiralEndpoint<chrial::IncomingData, chrial::TalosData>;
-
-// ============ 向后兼容别名 (deprecated) ============
-
-using TalosDataWriter [[deprecated("Use TalosSide instead")]]  = ChannelWriter<chrial::TalosData>;
-using TalosDataReader [[deprecated("Use RemoteSide instead")]] = ChannelReader<chrial::TalosData>;
 
 } // namespace talos::chiral::ipc

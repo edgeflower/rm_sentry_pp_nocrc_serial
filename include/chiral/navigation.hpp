@@ -1,11 +1,12 @@
 #pragma once
 
-// CHRIAL: bridge between talos and ROS2
-
+#include "chiral/chiral_endpoint.hpp"
 #include <array>
+#include <concepts>
+#include <chrono>
 #include <cstdint>
 
-namespace talos::chrial {
+namespace talos::chiral::navigation {
 
 // 编译期 Tag, 用于标注类型, 0运行时开销
 template <typename T>
@@ -74,7 +75,8 @@ enum class ArmorName : uint8_t {
     Outpost,
     Base,
     BaseLarge,
-    Invalid
+    Invalid,
+    MaxNum
 };
 
 struct OutpostState {
@@ -114,10 +116,47 @@ struct TalosData {
     Transform<gimbal_yaw, camera> camera_link;
 };
 
-// ============ Incoming data (External → Talos) ============
+struct NavigationData {
+    int64_t timestamp_ns = 0;
+    uint64_t duration_ns = 1000000000ULL;
+    bool invincible[static_cast<size_t>(ArmorName::MaxNum)];
 
-struct IncomingData {
-    uint64_t timestamp_ns = 0;
+    void set_invincible(ArmorName name, bool invincible_) noexcept {
+        invincible[static_cast<size_t>(name)] = invincible_;
+    }
+
+    bool is_invincible(ArmorName name) const noexcept {
+        return invincible[static_cast<size_t>(name)];
+    }
+
+    void emplace_invincible(
+        std::initializer_list<ArmorName> names, bool invincible_ = true) noexcept {
+        for (auto name : names) {
+            set_invincible(name, invincible_);
+        }
+    }
+
+    static NavigationData create(uint64_t duration_ns_ = 1000000000ULL) noexcept {
+        const auto now = std::chrono::system_clock::now();
+        auto t =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+        return {.timestamp_ns = t, .duration_ns = duration_ns_, .invincible = {}};
+    }
 };
 
-} // namespace talos::chrial
+using TalosEndpoint      = ipc::ChiralEndpoint<TalosData, NavigationData>;
+using NavigationEndpoint = ipc::ChiralEndpoint<NavigationData, TalosData>;
+
+}; // namespace talos::chiral::navigation
+namespace talos::chiral::ipc {
+
+template <>
+struct ShmName<navigation::TalosData> {
+    static constexpr const char* value = "/chiral_nav_talos";
+};
+
+template <>
+struct ShmName<navigation::NavigationData> {
+    static constexpr const char* value = "/chiral_nav_navigation";
+};
+} // namespace talos::chiral::ipc

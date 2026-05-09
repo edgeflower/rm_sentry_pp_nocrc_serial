@@ -1,8 +1,9 @@
 #include "chiral/chiral_endpoint.hpp"
-#include "chiral/chrial.hpp"
+#include "chiral/navigation.hpp"
 #include "rm_sentry_pp_nocrc_serial/node.hpp"
 #include "rm_sentry_pp_nocrc_serial/packet.hpp"
 #include <rclcpp/logging.hpp>
+#include <rm_decision_interfaces/msg/detail/enemy_forbidden_area__struct.hpp>
 #include <rm_decision_interfaces/msg/detail/enemy_location__struct.hpp>
 
 using namespace std::chrono_literals;
@@ -88,6 +89,9 @@ Node::Node(const rclcpp::NodeOptions& options)
             [this]() { updateMapToOdom(); });
     }
 
+    enemy_forbidden_area_sub = create_subscription<rm_decision_interfaces::msg::EnemyForbiddenArea>("enemy_in_forbidden_area",10,
+    [this](const rm_decision_interfaces::msg::EnemyForbiddenArea msg) { updateEnemyForbiddenArea(msg); });
+
     // 机器人姿态状态
     posture_pub_ = create_publisher<rm_decision_interfaces::msg::SentryPostureStatus>("sentry_posture_status", 10);
 
@@ -127,13 +131,16 @@ Node::Node(const rclcpp::NodeOptions& options)
     last_odom_time_ = node_start_;
 
     // 初始化 Chiral 读取器
-    auto chiral_reader = talos::chiral::ipc::RemoteSide::create();
+    auto chiral_reader = talos::chiral::navigation::NavigationEndpoint::create();
     if (chiral_reader) {
-        chiral_reader_ = std::make_unique<talos::chiral::ipc::RemoteSide>(std::move(*chiral_reader));
+        chiral_reader_ = std::move(chiral_reader.value());
         RCLCPP_INFO(get_logger(), "Chiral reader initialized successfully");
     } else {
         RCLCPP_WARN(get_logger(), "Failed to initialize chiral reader: %d", static_cast<int>(chiral_reader.error()));
     }
+    auto nd =talos::chiral::navigation::NavigationData::create();
+    nd.set_invincible(talos::chiral::navigation::ArmorName::Sentry, true);
+    chiral_reader_->write(nd);
 
     // Gimbal 路径跟随高频重采样 timer
     gimbal_path_timer_ = create_wall_timer(
@@ -866,7 +873,17 @@ void Node::chiralLoop()
     }
 }
 
-void Node::publishTargetTracking(const talos::chrial::TalosData& talos_data)
+void Node::updateEnemyForbiddenArea(const rm_decision_interfaces::msg::EnemyForbiddenArea& msg)
+{
+    auto armorName = static_cast<talos::chiral::navigation::ArmorName>(msg.armors_num);
+    invincible_cache_[static_cast<size_t>(armorName)] = msg.is_forbidden;
+
+    auto chiral_write = talos::chiral::navigation::NavigationData::create();
+    std::copy(std::begin(invincible_cache_), std::end(invincible_cache_), std::begin(chiral_write.invincible));
+    chiral_reader_->write(chiral_write);
+}
+
+void Node::publishTargetTracking(const talos::chiral::navigation::TalosData& talos_data)
 {
     auto now = this->now();
 
@@ -878,26 +895,26 @@ void Node::publishTargetTracking(const talos::chrial::TalosData& talos_data)
     // 1. 先处理追踪状态
     // ===============================
     switch (talos_data.state.status) {
-        case talos::chrial::TrackerStatus::Idle:
+        case talos::chiral::navigation::TrackerStatus::Idle:
             target_msg.tracking = false;
             target_msg.tracking_status = 0;
             target_msg.confidence = 0.0;
 
             break;
 
-        case talos::chrial::TrackerStatus::Detecting:
+        case talos::chiral::navigation::TrackerStatus::Detecting:
             target_msg.tracking = false;
             target_msg.tracking_status = 1;
             target_msg.confidence = 0.0;
             break;
 
-        case talos::chrial::TrackerStatus::Tracking:
+        case talos::chiral::navigation::TrackerStatus::Tracking:
             target_msg.tracking = true;
             target_msg.tracking_status = 2;
             target_msg.confidence = 1.0;
             break;
 
-        case talos::chrial::TrackerStatus::TempLost:
+        case talos::chiral::navigation::TrackerStatus::TempLost:
             target_msg.tracking = true;
             target_msg.tracking_status = 3;
             target_msg.confidence = 1.0;
@@ -908,7 +925,7 @@ void Node::publishTargetTracking(const talos::chrial::TalosData& talos_data)
     // ===============================
     // 2. 如果当前正在追踪目标，使用视觉实时数据
     // ===============================
-    if (talos_data.state.status == talos::chrial::TrackerStatus::Tracking || talos_data.state.status == talos::chrial::TrackerStatus::TempLost) {
+    if (talos_data.state.status == talos::chiral::navigation::TrackerStatus::Tracking || talos_data.state.status == talos::chiral::navigation::TrackerStatus::TempLost) {
         double enemy_x = 0.0;
         double enemy_y = 0.0;
         double enemy_z = 0.0;
@@ -928,7 +945,7 @@ void Node::publishTargetTracking(const talos::chrial::TalosData& talos_data)
         // y：云台左侧
         // z：上方
         // -------------------------------
-        if (talos_data.state_kind == talos::chrial::TargetStateKind::Robot) {
+        if (talos_data.state_kind == talos::chiral::navigation::TargetStateKind::Robot) {
             enemy_x = talos_data.state.robot.position.x;
             enemy_y = talos_data.state.robot.position.y;
             enemy_z = talos_data.state.robot.position.z;
@@ -936,7 +953,7 @@ void Node::publishTargetTracking(const talos::chrial::TalosData& talos_data)
             enemy_vx = talos_data.state.robot.velocity.x;
             enemy_vy = talos_data.state.robot.velocity.y;
             enemy_vz = talos_data.state.robot.velocity.z;
-        } else if (talos_data.state_kind == talos::chrial::TargetStateKind::Outpost) {
+        } else if (talos_data.state_kind == talos::chiral::navigation::TargetStateKind::Outpost) {
             enemy_x = talos_data.state.outpost.position.x;
             enemy_y = talos_data.state.outpost.position.y;
             enemy_z = talos_data.state.outpost.position.z;
@@ -970,12 +987,14 @@ void Node::publishTargetTracking(const talos::chrial::TalosData& talos_data)
         target_msg.velocity.x = 0.0;
         target_msg.velocity.y = 0.0;
         target_msg.velocity.z = 0.0;
+        target_msg.confidence = 0.0;
+        target_tracking_pub_->publish(target_msg);
     }
 
     // ===============================
     // 10. 补充机器人目标的装甲板信息
     // ===============================
-    if (talos_data.state_kind == talos::chrial::TargetStateKind::Robot) {
+    if (talos_data.state_kind == talos::chiral::navigation::TargetStateKind::Robot) {
         target_msg.yaw = talos_data.state.robot.yaw;
         target_msg.v_yaw = talos_data.state.robot.v_yaw;
 
@@ -986,28 +1005,28 @@ void Node::publishTargetTracking(const talos::chrial::TalosData& talos_data)
 
         std::ostringstream oss;
         switch (talos_data.state.name) {
-            case talos::chrial::ArmorName::Sentry:
+            case talos::chiral::navigation::ArmorName::Sentry:
                 oss << "sentry";
                 break;
-            case talos::chrial::ArmorName::One:
+            case talos::chiral::navigation::ArmorName::One:
                 oss << "hero";
                 break;
-            case talos::chrial::ArmorName::Two:
+            case talos::chiral::navigation::ArmorName::Two:
                 oss << "engineer";
                 break;
-            case talos::chrial::ArmorName::Three:
+            case talos::chiral::navigation::ArmorName::Three:
                 oss << "standard_3";
                 break;
-            case talos::chrial::ArmorName::Four:
+            case talos::chiral::navigation::ArmorName::Four:
                 oss << "standard_4";
                 break;
-            case talos::chrial::ArmorName::Five:
+            case talos::chiral::navigation::ArmorName::Five:
                 oss << "standard_5";
                 break;
-            case talos::chrial::ArmorName::Outpost:
+            case talos::chiral::navigation::ArmorName::Outpost:
                 oss << "outpost";
                 break;
-            case talos::chrial::ArmorName::Base:
+            case talos::chiral::navigation::ArmorName::Base:
                 oss << "base";
                 break;
             default:
@@ -1021,7 +1040,7 @@ void Node::publishTargetTracking(const talos::chrial::TalosData& talos_data)
     // ===============================
     // 11. 补充前哨站目标信息
     // ===============================
-    else if (talos_data.state_kind == talos::chrial::TargetStateKind::Outpost) {
+    else if (talos_data.state_kind == talos::chiral::navigation::TargetStateKind::Outpost) {
         target_msg.yaw = talos_data.state.outpost.yaw;
         target_msg.v_yaw = talos_data.state.outpost.v_yaw;
 
