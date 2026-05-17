@@ -5,6 +5,7 @@
 #include <rclcpp/logging.hpp>
 #include <rm_decision_interfaces/msg/detail/enemy_forbidden_area__struct.hpp>
 #include <rm_decision_interfaces/msg/detail/enemy_location__struct.hpp>
+#include <rm_decision_interfaces/msg/detail/self_robot_hp__struct.hpp>
 
 using namespace std::chrono_literals;
 
@@ -39,6 +40,7 @@ Node::Node(const rclcpp::NodeOptions& options)
     gimbal_lookahead_base_ = declare_parameter<double>("gimbal_lookahead_base", 0.8);
     gimbal_lookahead_k_ = declare_parameter<double>("gimbal_lookahead_k", 0.4);
     gimbal_yaw_smooth_alpha_ = declare_parameter<double>("gimbal_yaw_smooth_alpha", 0.3);
+    robot_area_name_ = declare_parameter<std::string>("robot_area_name", "bumpy_area");
 
     RCLCPP_INFO(get_logger(), "Gimbal follow: base=%.2f, k=%.2f, alpha=%.2f",
                 gimbal_lookahead_base_, gimbal_lookahead_k_, gimbal_yaw_smooth_alpha_);
@@ -90,7 +92,10 @@ Node::Node(const rclcpp::NodeOptions& options)
     }
 
     enemy_forbidden_area_sub = create_subscription<rm_decision_interfaces::msg::EnemyForbiddenArea>("enemy_in_forbidden_area",10,
-    [this](const rm_decision_interfaces::msg::EnemyForbiddenArea msg) { updateEnemyForbiddenArea(msg); });
+    [this](const rm_decision_interfaces::msg::EnemyForbiddenArea::SharedPtr msg) { updateEnemyForbiddenArea(*msg); });
+
+    robot_area_status_sub = create_subscription<rm_decision_interfaces::msg::RobotAreaStatus>("robot_area_status",10,
+    [this](const rm_decision_interfaces::msg::RobotAreaStatus::SharedPtr msg) { onRobotAreaStatus(*msg); });
 
     // 机器人姿态状态
     posture_pub_ = create_publisher<rm_decision_interfaces::msg::SentryPostureStatus>("sentry_posture_status", 10);
@@ -101,8 +106,11 @@ Node::Node(const rclcpp::NodeOptions& options)
     // 比赛状态信息
     game_status_pub_ = create_publisher<rm_decision_interfaces::msg::GameStatus>("game_status", 10);
 
-    // 所有机器人血量消息
-    all_robot_hp_pub_ = create_publisher<rm_decision_interfaces::msg::AllRobotHP>("all_robot_hp", 10);
+    // 己方机器人血量消息  因为敌方机器人血量信息暂时没有，所以这个消息里先只发布己方机器人血量
+    all_robot_hp_pub_ = create_publisher<rm_decision_interfaces::msg::SelfRobotHP>("self_robot_hp", 10); 
+
+    // 是否开始保存地图消息  （是否保存odin1地图）
+    start_save_map_pub_ = create_publisher<std_msgs::msg::Bool>("start_save_map",10);
 
     // 机器人位置信息消息
     robot_location_pub_ = create_publisher<rm_decision_interfaces::msg::FriendLocation>("robot_location", 10);
@@ -198,9 +206,9 @@ void Node::onRobotControl(const rm_decision_interfaces::msg::RobotControl& msg)
     std::lock_guard<std::mutex> lk(tx_mtx_);
     current_cmd_state_.data.gimbal_big.yaw_vel = msg.gimbal_big_yaw_vel;
     target_spin_vel_ = msg.chassis_spin_vel;
-    follow_gimbal_big_ = msg.follow_gimbal_big;
-    track_status_ = msg.track_status;
-    perception_status_ = msg.perception_status;
+    // follow_gimbal_big_ = msg.follow_gimbal_big;
+    // track_status_ = msg.track_status;
+    // perception_status_ = msg.perception_status;
     tx_pending_ = true;
 }
 
@@ -602,7 +610,7 @@ void Node::parseFrames(std::vector<uint8_t>& rxbuf)
             }
         }
         if(hdr.id == rm_sentry_pp::ID_ALL_ROBOT_HP){
-            if(hdr.data_len == sizeof(rm_sentry_pp::ReceiveAllRobotHpData::data) && frame_len == sizeof(rm_sentry_pp::ReceiveAllRobotHpData)){
+            if(hdr.data_len == sizeof(rm_sentry_pp::ReceiveAllRobotHpData::self_robot_hp) && frame_len == sizeof(rm_sentry_pp::ReceiveAllRobotHpData)){
                 auto all_robot_hp = rm_sentry_pp::fromBytes<rm_sentry_pp::ReceiveAllRobotHpData>(rxbuf.data());
                 publishAllRobotHp(all_robot_hp);
             }
@@ -725,9 +733,12 @@ void Node::publishRobotInfo(const rm_sentry_pp::ReceiveRobotInfoData& robot_info
     robot_status_msg.is_attacked = robot_info_data.data.attacked;
     robot_status_msg.current_hp = robot_info_data.data.hp;
     robot_status_msg.shot_allowance = robot_info_data.data.shot_allowance;
-    robot_status_msg.shooter_heat = robot_info_data.data.heat_limit;
+    robot_status_msg.shooter_heat = robot_info_data.data.heat_limit - robot_info_data.data.heat; // 这里转换成剩余可射击量，更直观一些
 
     robot_status_pub_->publish(robot_status_msg);
+    std_msgs::msg::Bool start_save_map_msg;
+    start_save_map_msg.data = robot_info_data.data.start_save_map;
+    start_save_map_pub_->publish(start_save_map_msg);
 }
 
 void Node::publishGameStatus(const rm_sentry_pp::ReceiveGameStatusData& game_status_data)
@@ -744,23 +755,16 @@ void Node::publishAllRobotHp(const rm_sentry_pp::ReceiveAllRobotHpData& all_robo
 {
     auto now = this->now();
 
-    rm_decision_interfaces::msg::AllRobotHP all_robot_hp_msg;
-    all_robot_hp_msg.red_1_robot_hp = all_robot_hp_data.data.red_1_robot_hp;
-    all_robot_hp_msg.red_2_robot_hp = all_robot_hp_data.data.red_2_robot_hp;
-    all_robot_hp_msg.red_3_robot_hp = all_robot_hp_data.data.red_3_robot_hp;
-    all_robot_hp_msg.red_4_robot_hp = all_robot_hp_data.data.red_4_robot_hp;
-    all_robot_hp_msg.red_7_robot_hp = all_robot_hp_data.data.red_7_robot_hp;
-    all_robot_hp_msg.red_outpost_hp = all_robot_hp_data.data.red_outpost_hp;
-    all_robot_hp_msg.red_base_hp = all_robot_hp_data.data.red_base_hp;
-    all_robot_hp_msg.blue_1_robot_hp = all_robot_hp_data.data.blue_1_robot_hp;
-    all_robot_hp_msg.blue_2_robot_hp = all_robot_hp_data.data.blue_2_robot_hp;
-    all_robot_hp_msg.blue_3_robot_hp = all_robot_hp_data.data.blue_3_robot_hp;
-    all_robot_hp_msg.blue_4_robot_hp = all_robot_hp_data.data.blue_4_robot_hp;
-    all_robot_hp_msg.blue_7_robot_hp = all_robot_hp_data.data.blue_7_robot_hp;
-    all_robot_hp_msg.blue_outpost_hp = all_robot_hp_data.data.blue_outpost_hp;
-    all_robot_hp_msg.blue_base_hp = all_robot_hp_data.data.blue_base_hp;
+    rm_decision_interfaces::msg::SelfRobotHP self_robot_hp_msg;
+    self_robot_hp_msg.hero_hp = all_robot_hp_data.self_robot_hp.hero_hp;
+    self_robot_hp_msg.engineer_hp = all_robot_hp_data.self_robot_hp.engineer_hp;
+    self_robot_hp_msg.standard_3_hp = all_robot_hp_data.self_robot_hp.standard_3_hp;
+    self_robot_hp_msg.standard_4_hp = all_robot_hp_data.self_robot_hp.standard_4_hp;
+    self_robot_hp_msg.sentry_hp = all_robot_hp_data.self_robot_hp.sentry_hp;
+    self_robot_hp_msg.outpost_hp = all_robot_hp_data.self_robot_hp.outpost_hp;
+    self_robot_hp_msg.base_hp = all_robot_hp_data.self_robot_hp.base_hp;
 
-    all_robot_hp_pub_->publish(all_robot_hp_msg);
+    all_robot_hp_pub_->publish(self_robot_hp_msg);
 }
 
 void Node::publishRobotLocation(const rm_sentry_pp::ReceiveRobotLocation& robot_location_data)
@@ -882,6 +886,23 @@ void Node::updateEnemyForbiddenArea(const rm_decision_interfaces::msg::EnemyForb
     std::copy(std::begin(invincible_cache_), std::end(invincible_cache_), std::begin(chiral_write.invincible));
     chiral_reader_->write(chiral_write);
 }
+void Node::onRobotAreaStatus(const rm_decision_interfaces::msg::RobotAreaStatus& msg)
+{
+    if(msg.is_in_area && msg.area_name == robot_area_name_ && msg.matched_area_names == std::vector<std::string>{robot_area_name_})
+    {
+        // Handle the case when the robot is in the specified area
+        perception_status_ = false;  // 进入起伏路段，认为无法感知敌人
+        track_status_ = true;        // 进入起伏路段，开启底盘履带
+        follow_gimbal_big_ = true;     // 进入起伏路段，跟随 gimbal_big
+    }
+    else
+    {
+    // Handle the case when the robot is outside the specified area
+        perception_status_ = true;  // 离开起伏路段，认为可以感知敌人
+        track_status_ = false;       // 离开起伏路段，关闭底盘履带
+        follow_gimbal_big_ = false;    // 离开起伏路段，不跟随 gimbal_big
+    }
+}
 
 void Node::publishTargetTracking(const talos::chiral::navigation::TalosData& talos_data)
 {
@@ -953,15 +974,19 @@ void Node::publishTargetTracking(const talos::chiral::navigation::TalosData& tal
             enemy_vx = talos_data.state.robot.velocity.x;
             enemy_vy = talos_data.state.robot.velocity.y;
             enemy_vz = talos_data.state.robot.velocity.z;
-        } else if (talos_data.state_kind == talos::chiral::navigation::TargetStateKind::Outpost) {
-            enemy_x = talos_data.state.outpost.position.x;
-            enemy_y = talos_data.state.outpost.position.y;
-            enemy_z = talos_data.state.outpost.position.z;
+        } 
+        // else if (talos_data.state_kind == talos::chiral::navigation::TargetStateKind::Outpost) {
+        //     enemy_x = talos_data.state.outpost.position.x;
+        //     enemy_y = talos_data.state.outpost.position.y;
+        //     enemy_z = talos_data.state.outpost.position.z;
 
-            enemy_vx = talos_data.state.outpost.velocity.x;
-            enemy_vy = talos_data.state.outpost.velocity.y;
-            enemy_vz = talos_data.state.outpost.velocity.z;
-        } else {
+        //     enemy_vx = talos_data.state.outpost.velocity.x;
+        //     enemy_vy = talos_data.state.outpost.velocity.y;
+        //     enemy_vz = talos_data.state.outpost.velocity.z;
+        // } 
+        else {
+            target_msg.tracking = false;
+            target_msg.confidence = 0.0;
             target_tracking_pub_->publish(target_msg);
             return;
         }
@@ -987,8 +1012,16 @@ void Node::publishTargetTracking(const talos::chiral::navigation::TalosData& tal
         target_msg.velocity.x = 0.0;
         target_msg.velocity.y = 0.0;
         target_msg.velocity.z = 0.0;
-        target_msg.confidence = 0.0;
+        target_msg.confidence = 0.0;  // 没有目标时置信度显式为0，去除前哨站
         target_tracking_pub_->publish(target_msg);
+        visualization_msgs::msg::Marker del_marker;
+        del_marker.header.stamp = now;
+        del_marker.header.frame_id = "gimbal_yaw";
+        del_marker.ns = "enemy";
+        del_marker.id = 0;
+        del_marker.action = visualization_msgs::msg::Marker::DELETE;
+        enemy_marker_pub_->publish(del_marker);
+        return;
     }
 
     // ===============================
@@ -1045,7 +1078,7 @@ void Node::publishTargetTracking(const talos::chiral::navigation::TalosData& tal
         target_msg.v_yaw = talos_data.state.outpost.v_yaw;
 
         target_msg.id = "outpost";
-        target_msg.armors_num = 3;
+        target_msg.armors_num = 6; // 前哨站特殊标记为 6
     }
 
     // ===============================
@@ -1113,7 +1146,7 @@ void Node::txLoop()
                     double predicted_drift = gimbal_big_drift_ + gimbal_big_drift_rate_ * dt_since;
                     gimbal_big_yaw_angle_state_ = gimbal_big_yaw_angle_ + predicted_drift;
                     pkt.data.gimbal_big.yaw_angle = gimbal_big_yaw_angle_state_;
-                        RCLCPP_INFO_THROTTLE(
+                        RCLCPP_DEBUG_THROTTLE(
                         this->get_logger(),
                         *this->get_clock(),
                         1000,   // ms
@@ -1122,8 +1155,8 @@ void Node::txLoop()
                     );
                     pkt.data.gimbal_big.yaw_vel = 0.0f;
                 } else {
-                    pkt.data.gimbal_big.yaw_angle = 0.0f;
-                    pkt.data.gimbal_big.yaw_vel = current_cmd_state_.data.gimbal_big.yaw_vel;
+                    pkt.data.gimbal_big.yaw_angle = gimbal_big_yaw_angle_state_;  // 角度过期，继续发布预测的角度，但不再更新预测值（相当于冻结在最后一个有效角度）。去除了速度控制
+                    pkt.data.gimbal_big.yaw_vel = 0.0f;
                 }
 
                 pkt.eof = rm_sentry_pp::HeaderFrame::EoF();

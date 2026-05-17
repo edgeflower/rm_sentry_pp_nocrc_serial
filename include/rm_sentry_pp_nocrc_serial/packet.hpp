@@ -49,6 +49,7 @@ struct ReceiveRobotInfoData
         uint16_t shot_allowance; // 17mm弹丸剩余量
         uint8_t posture; // 机器人实际姿态 1=进攻, 2=防御, 3=移动 (下位机控制)
         bool nav_status; // 机器人初始化状态 false 未初始化， true 已初始化
+        bool start_save_map; // 机器人是否开始保存地图  （是否保存odin1地图）
     } data;  // 裁判系统信息
 
     uint8_t eof; // 0xA5
@@ -76,7 +77,7 @@ struct ReceiveGameStatusData
 
 
 
-// 全场机器人hp信息数据包  0x0003
+// 全场机器人hp信息数据包  0x0003 由于今年雷达没有解析出信息波，所以这个包里暂时只有己方机器人hp信息，并且为了减轻带宽压力，敌方机器人hp信息暂时没有
 struct ReceiveAllRobotHpData
 {
     HeaderFrame frame_header;  // id = 0x08
@@ -85,23 +86,14 @@ struct ReceiveAllRobotHpData
 
     struct
     {
-        uint16_t red_1_robot_hp;  // 红方英雄机器人血量
-        uint16_t red_2_robot_hp;  // 红方工程机器人血量
-        uint16_t red_3_robot_hp;  // 红方步兵机器人血量
-        uint16_t red_4_robot_hp;  // 红方步兵机器人血量
-        uint16_t red_5_robot_hp;  // 保留位
-        uint16_t red_7_robot_hp;  // 红方哨兵机器人血量
-        uint16_t red_outpost_hp;  // 红方前哨站血量
-        uint16_t red_base_hp;     // 红方基地血量
-        uint16_t blue_1_robot_hp; // 蓝方英雄机器人血量
-        uint16_t blue_2_robot_hp; // 蓝方工程机器人血量
-        uint16_t blue_3_robot_hp; // 蓝方步兵机器人血量
-        uint16_t blue_4_robot_hp; // 蓝方步兵机器人血量
-        uint16_t blue_5_robot_hp; // 保留位
-        uint16_t blue_7_robot_hp; // 蓝方哨兵机器人血量
-        uint16_t blue_outpost_hp; // 蓝方前哨站血量
-        uint16_t blue_base_hp;    // 蓝方基地血量
-    } data;
+        uint16_t hero_hp; // 英雄机器人血量
+        uint16_t engineer_hp; // 工程机器人血量
+        uint16_t standard_3_hp; // 3号步兵机器人血量
+        uint16_t standard_4_hp; // 4号步兵机器人血量
+        uint16_t sentry_hp; // 哨兵机器人血量
+        uint16_t outpost_hp; // 前哨站血量
+        uint16_t base_hp; // 基地血量
+    } self_robot_hp;
 
     uint8_t eof; // 0xA5
 
@@ -241,7 +233,7 @@ struct ReceiveImuData {
     uint32_t time_stamp;
 
     struct {
-        uint8_t self_color; // 0=红色，1=蓝色
+        // uint8_t self_color; // 0=红色，1=蓝色
         float gimbal_yaw; // 小云台 gimbal_yaw 的机械角 与上电时偏移角度（正中心） 单位 ° ，而不是 gimbal_big 的机械角，gimbal_big 只有 imu 的角度
         float chassis_yaw; // 底盘位姿 下位机计算出来的 范围 -π ~ π // 这玩意 用不上，先不用
         float yaw; // rad  这是 gimbal_big 的 imu 角度 ，而 gimbal_yaw的imu 角度 在 视觉给的 imu 信息里
@@ -290,11 +282,11 @@ struct SendRobotPostureData   // 机器人姿态 0x0120
 #pragma pack(pop)
 
 static_assert(sizeof(HeaderFrame) == 3);
-static_assert(sizeof(ReceiveRobotInfoData) == 21);    // 3 + 4 + 15 + 1
+static_assert(sizeof(ReceiveRobotInfoData) == 22);    // 3 + 4 + 15 + 1
 static_assert(sizeof(ReceiveGameStatusData) == 11);   // 3 + 4 + 3 + 1
-static_assert(sizeof(ReceiveAllRobotHpData) == 40);   // 3 + 4 + 33 + 1
+static_assert(sizeof(ReceiveAllRobotHpData) == 22);   // 3 + 4 + 33 + 1
 static_assert(sizeof(ReceiveRobotLocation) == 48);    // 3 + 4 + 40 + 1
-static_assert(sizeof(ReceiveImuData) == 21);          // 3 + 4 + 13 + 1
+static_assert(sizeof(ReceiveImuData) == 20);          // 3 + 4 + 13 + 1
 static_assert(sizeof(SendRobotCmdData) == 28);        // 3 + 4 + 16 + 1
 static_assert(sizeof(SendRobotPostureData) == 12);    // 3 + 4 + 3 + 1
 static_assert(sizeof(ReceiveRfid) == 13 );            // 3 + 4 + 5 + 1

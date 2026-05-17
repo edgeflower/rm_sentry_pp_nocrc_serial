@@ -12,3 +12,4 @@ rm_sentry_pp_nocrc_serial:
     gimbal_follow_lookahead: 0.4
     gimbal_lookahead_k: 1.0
     gimbal_yaw_smooth_alpha: 0.01  # 0=非常平滑/迟缓，1=无滤波
+    robot_area_name: bumpy_area

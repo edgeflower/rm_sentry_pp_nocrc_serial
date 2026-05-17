@@ -4,11 +4,14 @@
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
+#include <rcl/context.h>
 #include <rclcpp/publisher_base.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/subscription.hpp>
 #include <rm_decision_interfaces/msg/detail/enemy_forbidden_area__struct.hpp>
 #include <rm_decision_interfaces/msg/detail/enemy_location__struct.hpp>
+#include <rm_decision_interfaces/msg/detail/robot_area_status__struct.hpp>
+#include <rm_decision_interfaces/msg/detail/self_robot_hp__struct.hpp>
 #include <rm_decision_interfaces/msg/detail/sentry_posture_status__struct.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <visualization_msgs/msg/marker.hpp>
@@ -19,6 +22,7 @@
 #include <tf2_ros/transform_listener.h>
 #include <armor_interfaces/msg/target.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <std_msgs/msg/bool.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -48,6 +52,8 @@
 #include<rm_decision_interfaces/msg/enemy_location.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <rm_decision_interfaces/msg/enemy_forbidden_area.hpp>
+#include <rm_decision_interfaces/msg/robot_area_status.hpp>
+#include <rm_decision_interfaces/msg/self_robot_hp.hpp>
 
 namespace rm_sentry_pp_nocrc_serial {
 
@@ -93,6 +99,7 @@ private:
 
     double calculateDecayedConfidence(double current_confidence, double dt);
     void updateEnemyForbiddenArea(const rm_decision_interfaces::msg::EnemyForbiddenArea& enemy_forbidden_area);
+    void onRobotAreaStatus(const rm_decision_interfaces::msg::RobotAreaStatus& robot_area_status);
 
     // params
     std::string port_;
@@ -114,6 +121,7 @@ private:
     double gimbal_lookahead_k_ { 0.4 };
     double gimbal_yaw_smooth_alpha_ { 0.3 };
     bool nav_status_ = false;
+    std::string robot_area_name_;
 
     // Odometry parameters
     std::string odom_topic_;
@@ -135,11 +143,13 @@ private:
     rclcpp::Publisher<rm_decision_interfaces::msg::SentryPostureStatus>::SharedPtr posture_pub_;
     rclcpp::Publisher<rm_decision_interfaces::msg::RobotStatus>::SharedPtr robot_status_pub_;
     rclcpp::Publisher<rm_decision_interfaces::msg::GameStatus>::SharedPtr game_status_pub_;
-    rclcpp::Publisher<rm_decision_interfaces::msg::AllRobotHP>::SharedPtr all_robot_hp_pub_;
+    rclcpp::Publisher<rm_decision_interfaces::msg::SelfRobotHP>::SharedPtr all_robot_hp_pub_;
     rclcpp::Publisher<rm_decision_interfaces::msg::FriendLocation>::SharedPtr robot_location_pub_;
     rclcpp::Publisher<rm_decision_interfaces::msg::RFIDParse>::SharedPtr rfid_pub_;
     rclcpp::Publisher<rm_decision_interfaces::msg::EnemyLocation>::SharedPtr enemy_location_pub_;
     rclcpp::Subscription<rm_decision_interfaces::msg::EnemyForbiddenArea>::SharedPtr enemy_forbidden_area_sub;
+    rclcpp::Subscription<rm_decision_interfaces::msg::RobotAreaStatus>::SharedPtr robot_area_status_sub;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr start_save_map_pub_;
 
     // serial
     SerialPort sp_;
@@ -245,6 +255,8 @@ private:
     // Confidence decay parameters
     double confidence_decay_lambda_ = 0.5;
     double min_confidence_threshold_ = 0.3;
+
+    rm_decision_interfaces::msg::RobotAreaStatus::SharedPtr robot_area_status_;
 };
 
 } // namespace rm_sentry_pp_nocrc_serial
