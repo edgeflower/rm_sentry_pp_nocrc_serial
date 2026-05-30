@@ -273,6 +273,7 @@ struct SendRobotPostureData   // 机器人姿态 0x0120
         bool follow_gimbal_big; // 是否跟随大云台 0 不跟随 1 跟随  //底盘跟随
         bool track_status;      // 是否启动履带 0 不启动 1 启动
         bool perception_status;  // 大云台是否跟随全向感知 0 不跟随
+        bool start_gimbal_big_spin; // 是否开始大云台旋转 0 不旋转 1 旋转
     } data;
 
     uint8_t eof; // 0xA5
@@ -288,7 +289,7 @@ static_assert(sizeof(ReceiveAllRobotHpData) == 22);   // 3 + 4 + 33 + 1
 static_assert(sizeof(ReceiveRobotLocation) == 48);    // 3 + 4 + 40 + 1
 static_assert(sizeof(ReceiveImuData) == 20);          // 3 + 4 + 13 + 1
 static_assert(sizeof(SendRobotCmdData) == 28);        // 3 + 4 + 16 + 1
-static_assert(sizeof(SendRobotPostureData) == 12);    // 3 + 4 + 3 + 1
+static_assert(sizeof(SendRobotPostureData) == 13);    // 3 + 4 + 3 + 1
 static_assert(sizeof(ReceiveRfid) == 13 );            // 3 + 4 + 5 + 1
 static_assert(sizeof(ReceiveRFID) == 46 );            // 3 + 4 + 38 + 1
 static_assert(sizeof(ReceiveEnemyLocation) == 48);    // 3 + 4 + 5 + 1

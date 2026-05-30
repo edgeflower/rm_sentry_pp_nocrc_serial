@@ -100,6 +100,7 @@ private:
     double calculateDecayedConfidence(double current_confidence, double dt);
     void updateEnemyForbiddenArea(const rm_decision_interfaces::msg::EnemyForbiddenArea& enemy_forbidden_area);
     void onRobotAreaStatus(const rm_decision_interfaces::msg::RobotAreaStatus& robot_area_status);
+    bool isArmorForbidden(talos::chiral::navigation::ArmorName armor_name);
 
     // params
     std::string port_;
@@ -122,6 +123,7 @@ private:
     double gimbal_yaw_smooth_alpha_ { 0.3 };
     bool nav_status_ = false;
     std::string robot_area_name_;
+    bool start_gimbal_big_spin_ { false };
 
     // Odometry parameters
     std::string odom_topic_;
@@ -226,6 +228,7 @@ private:
     std::unique_ptr<talos::chiral::navigation::NavigationEndpoint> chiral_reader_;
     rm_decision_interfaces::msg::EnemyForbiddenArea enemy_forbidden_area_;
     bool invincible_cache_[static_cast<size_t>(talos::chiral::navigation::ArmorName::MaxNum)] = {};
+    std::mutex invincible_mtx_;
     
 
 

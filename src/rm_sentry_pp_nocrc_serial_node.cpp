@@ -206,6 +206,7 @@ void Node::onRobotControl(const rm_decision_interfaces::msg::RobotControl& msg)
     std::lock_guard<std::mutex> lk(tx_mtx_);
     current_cmd_state_.data.gimbal_big.yaw_vel = msg.gimbal_big_yaw_vel;
     target_spin_vel_ = msg.chassis_spin_vel;
+    start_gimbal_big_spin_ = msg.start_gimbal_big_spin;
     // follow_gimbal_big_ = msg.follow_gimbal_big;
     // track_status_ = msg.track_status;
     // perception_status_ = msg.perception_status;
@@ -879,12 +880,44 @@ void Node::chiralLoop()
 
 void Node::updateEnemyForbiddenArea(const rm_decision_interfaces::msg::EnemyForbiddenArea& msg)
 {
-    auto armorName = static_cast<talos::chiral::navigation::ArmorName>(msg.armors_num);
-    invincible_cache_[static_cast<size_t>(armorName)] = msg.is_forbidden;
+    const auto idx = static_cast<size_t>(msg.armors_num);
 
-    auto chiral_write = talos::chiral::navigation::NavigationData::create();
-    std::copy(std::begin(invincible_cache_), std::end(invincible_cache_), std::begin(chiral_write.invincible));
-    chiral_reader_->write(chiral_write);
+    {
+        std::lock_guard<std::mutex> lk(invincible_mtx_);
+
+        if (idx >= std::size(invincible_cache_)) {
+            RCLCPP_WARN(get_logger(),
+                "EnemyForbiddenArea armor index out of range: %zu", idx);
+            return;
+        }
+
+        invincible_cache_[idx] = msg.is_forbidden;
+    }
+
+    if (chiral_reader_) {
+        auto chiral_write = talos::chiral::navigation::NavigationData::create();
+        {
+            std::lock_guard<std::mutex> lk(invincible_mtx_);
+            std::copy(std::begin(invincible_cache_), std::end(invincible_cache_),
+                      std::begin(chiral_write.invincible));
+        }
+        chiral_reader_->write(chiral_write);
+    }
+
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+        "Enemy forbidden state: armor=%zu forbidden=%d", idx, msg.is_forbidden);
+}
+
+bool Node::isArmorForbidden(talos::chiral::navigation::ArmorName armor_name)
+{
+    const auto idx = static_cast<size_t>(armor_name);
+    std::lock_guard<std::mutex> lk(invincible_mtx_);
+
+    if (idx >= std::size(invincible_cache_)) {
+        return false;
+    }
+
+    return invincible_cache_[idx];
 }
 void Node::onRobotAreaStatus(const rm_decision_interfaces::msg::RobotAreaStatus& msg)
 {
@@ -947,6 +980,40 @@ void Node::publishTargetTracking(const talos::chiral::navigation::TalosData& tal
     // 2. 如果当前正在追踪目标，使用视觉实时数据
     // ===============================
     if (talos_data.state.status == talos::chiral::navigation::TrackerStatus::Tracking || talos_data.state.status == talos::chiral::navigation::TrackerStatus::TempLost) {
+        // ===============================
+        // 1.5 禁区拦截：目标在禁区内则抑制追踪
+        // ===============================
+        if (talos_data.state_kind == talos::chiral::navigation::TargetStateKind::Robot
+            && talos_data.state.name == talos::chiral::navigation::ArmorName::Two) {
+            if (isArmorForbidden(talos_data.state.name)) {
+                target_msg.tracking = false;
+                target_msg.tracking_status = 0;
+                target_msg.confidence = 0.0;
+                target_msg.position.x = 0.0;
+                target_msg.position.y = 0.0;
+                target_msg.position.z = 0.0;
+                target_msg.velocity.x = 0.0;
+                target_msg.velocity.y = 0.0;
+                target_msg.velocity.z = 0.0;
+                target_msg.id = "forbidden";
+                target_msg.armors_num = static_cast<int>(talos_data.state.robot.armor_num);
+
+                visualization_msgs::msg::Marker del_marker;
+                del_marker.header.stamp = now;
+                del_marker.header.frame_id = "gimbal_yaw";
+                del_marker.ns = "enemy";
+                del_marker.id = 0;
+                del_marker.action = visualization_msgs::msg::Marker::DELETE;
+                enemy_marker_pub_->publish(del_marker);
+
+                RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+                    "Target is in forbidden area, suppress tracking");
+
+                target_tracking_pub_->publish(target_msg);
+                return;
+            }
+        }
+
         double enemy_x = 0.0;
         double enemy_y = 0.0;
         double enemy_z = 0.0;
@@ -975,14 +1042,17 @@ void Node::publishTargetTracking(const talos::chiral::navigation::TalosData& tal
             enemy_vy = talos_data.state.robot.velocity.y;
             enemy_vz = talos_data.state.robot.velocity.z;
         } 
+        // 关闭前哨站信息，改为在巡逻点处停留45秒，增加哨兵的攻击机会，避免哨兵乱跑
         // else if (talos_data.state_kind == talos::chiral::navigation::TargetStateKind::Outpost) {
         //     enemy_x = talos_data.state.outpost.position.x;
         //     enemy_y = talos_data.state.outpost.position.y;
         //     enemy_z = talos_data.state.outpost.position.z;
 
-        //     enemy_vx = talos_data.state.outpost.velocity.x;
-        //     enemy_vy = talos_data.state.outpost.velocity.y;
-        //     enemy_vz = talos_data.state.outpost.velocity.z;
+        //     enemy_vx = 0.0;
+        //     enemy_vy = 0.0;
+        //     enemy_vz = 0.0;
+        //     // 对于前哨站，暂时没有速度信息，先默认是静止的
+        //     // 对于前哨站的补充是要哨兵进行攻击判定的，所以添加了一个特殊标记 armors_num = 6 来区分前哨站和机器人目标，在攻击判定时如果是前哨站就不考虑速度因素，直接进行攻击判定
         // } 
         else {
             target_msg.tracking = false;
@@ -1055,9 +1125,6 @@ void Node::publishTargetTracking(const talos::chiral::navigation::TalosData& tal
                 break;
             case talos::chiral::navigation::ArmorName::Five:
                 oss << "standard_5";
-                break;
-            case talos::chiral::navigation::ArmorName::Outpost:
-                oss << "outpost";
                 break;
             case talos::chiral::navigation::ArmorName::Base:
                 oss << "base";
@@ -1180,6 +1247,7 @@ void Node::txLoop()
                 pkt.data.follow_gimbal_big = follow_gimbal_big_;
                 pkt.data.track_status = track_status_;
                 pkt.data.perception_status = perception_status_;
+                pkt.data.start_gimbal_big_spin = start_gimbal_big_spin_;
                 pkt.eof = rm_sentry_pp::HeaderFrame::EoF();
             }
 
